@@ -20,8 +20,27 @@ pub struct TtsAudio {
     pub sample_rate: i32,
 }
 
-pub(crate) fn audio_track_buffer_bytes(min_buffer: i32) -> i32 {
-    min_buffer.saturating_mul(4).max(4096)
+pub(crate) fn stretch_pcm_chunk(
+    stretcher: &mut wsola::TimeStretch,
+    samples: &[i16],
+    speed: f32,
+    finish: bool,
+) -> Vec<i16> {
+    stretcher.set_tempo(speed);
+    stretcher.push(
+        &samples
+            .iter()
+            .map(|sample| f32::from(*sample) / 32768.0)
+            .collect::<Vec<_>>(),
+    );
+    let mut output = stretcher.pull(usize::MAX);
+    if finish {
+        output.extend(stretcher.flush());
+    }
+    output
+        .into_iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)
+        .collect()
 }
 
 pub fn synthesize_sentence(
@@ -268,8 +287,24 @@ pub fn markdown_text(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn audio_buffer_has_headroom_for_twice_speed() {
-        assert!(super::audio_track_buffer_bytes(4096) > 2 * 4096);
+    fn wsola_changes_tempo_mid_stream_without_changing_sample_rate() {
+        let input: Vec<i16> = (0..44_100)
+            .map(|i| ((i as f32 * 0.07).sin() * 10_000.0) as i16)
+            .collect();
+        let mut stretcher = wsola::TimeStretch::new(22_050, 1).unwrap();
+        let mut output = Vec::new();
+        for (index, chunk) in input.chunks(2_205).enumerate() {
+            let speed = if index < 10 { 1.0 } else { 2.0 };
+            output.extend(super::stretch_pcm_chunk(
+                &mut stretcher,
+                chunk,
+                speed,
+                false,
+            ));
+        }
+        output.extend(super::stretch_pcm_chunk(&mut stretcher, &[], 2.0, true));
+        assert!((28_000..38_000).contains(&output.len()));
+        assert!(output.iter().any(|sample| *sample != 0));
     }
 
     #[test]

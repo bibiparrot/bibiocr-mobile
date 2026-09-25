@@ -204,6 +204,7 @@ dependencies = [
  "sys-locale",
  "toml 0.9.12+spec-1.1.0",
  "ureq 3.4.2",
+ "wsola",
  "zip 6.0.0",
 ]
 
@@ -4383,6 +4384,15 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "wsola"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "542a5d4e1f44b1af2eeef27a918d15d117ce326af641153efbfe436b586418f5"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "x11rb"

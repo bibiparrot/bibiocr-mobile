@@ -306,6 +306,45 @@ pub fn share_text(text: &str) -> Result<(), String> {
     share("text/markdown", Some(text), None)
 }
 
+fn write_audio_track(
+    env: &mut JNIEnv<'_>,
+    track: &JObject<'_>,
+    pcm: &[i16],
+    stop: &AtomicBool,
+) -> Result<usize, String> {
+    if pcm.is_empty() {
+        return Ok(0);
+    }
+    let array = env
+        .new_short_array(pcm.len() as i32)
+        .map_err(|error| error.to_string())?;
+    env.set_short_array_region(&array, 0, pcm)
+        .map_err(|error| error.to_string())?;
+    let mut offset = 0;
+    while offset < pcm.len() && !stop.load(Ordering::Relaxed) {
+        let written = env
+            .call_method(
+                track,
+                "write",
+                "([SII)I",
+                &[
+                    JValueGen::Object(array.as_ref()),
+                    JValueGen::Int(offset as i32),
+                    JValueGen::Int((pcm.len() - offset) as i32),
+                ],
+            )
+            .and_then(|value| value.i())
+            .map_err(|error| error.to_string())?;
+        if written <= 0 {
+            return Err(format!("AudioTrack write failed: {written}"));
+        }
+        offset += written as usize;
+    }
+    env.delete_local_ref(array)
+        .map_err(|error| error.to_string())?;
+    Ok(offset)
+}
+
 pub fn play_pcm(
     samples: &[i16],
     sample_rate: i32,
@@ -316,6 +355,8 @@ pub fn play_pcm(
     if sample_rate <= 0 {
         return Err("Invalid TTS sample rate".to_owned());
     }
+    let mut stretcher =
+        wsola::TimeStretch::new(sample_rate as u32, 1).map_err(|error| error.to_string())?;
     robius_android_env::with_activity(|env, _| {
         let result = (|| {
             let min_buffer = env
@@ -343,89 +384,33 @@ pub fn play_pcm(
                         JValueGen::Int(sample_rate),
                         JValueGen::Int(4),
                         JValueGen::Int(2),
-                        JValueGen::Int(crate::tts::audio_track_buffer_bytes(min_buffer)),
+                        JValueGen::Int(min_buffer.max(4096)),
                         JValueGen::Int(1),
                     ],
                 )
                 .map_err(|error| error.to_string())?;
             let result = (|| {
-                let params = env
-                    .new_object("android/media/PlaybackParams", "()V", &[])
-                    .map_err(|error| error.to_string())?;
-                env.call_method(
-                    &params,
-                    "setPitch",
-                    "(F)Landroid/media/PlaybackParams;",
-                    &[JValueGen::Float(1.0)],
-                )
-                .map_err(|error| error.to_string())?;
-                let mut applied_speed = 0;
-                let mut update_speed = |env: &mut JNIEnv<'_>| -> Result<(), String> {
-                    let requested = speed.load(Ordering::Relaxed);
-                    if requested == applied_speed {
-                        return Ok(());
-                    }
-                    let rate = f32::from_bits(requested);
-                    if ![0.5, 0.75, 1.0, 1.25, 1.5, 2.0].contains(&rate) {
-                        return Err("Unsupported playback speed".to_owned());
-                    }
-                    env.call_method(
-                        &params,
-                        "setSpeed",
-                        "(F)Landroid/media/PlaybackParams;",
-                        &[JValueGen::Float(rate)],
-                    )
-                    .map_err(|error| error.to_string())?;
-                    env.call_method(
-                        &track,
-                        "setPlaybackParams",
-                        "(Landroid/media/PlaybackParams;)V",
-                        &[JValueGen::Object(&params)],
-                    )
-                    .map_err(|error| error.to_string())?;
-                    applied_speed = requested;
-                    Ok(())
-                };
                 env.call_method(&track, "play", "()V", &[])
                     .map_err(|error| error.to_string())?;
+                let mut queued = 0;
                 for chunk in samples.chunks(2048) {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    update_speed(env)?;
+                    let rate = f32::from_bits(speed.load(Ordering::Relaxed));
+                    if ![0.5, 0.75, 1.0, 1.25, 1.5, 2.0].contains(&rate) {
+                        return Err("Unsupported playback speed".to_owned());
+                    }
+                    let pcm = crate::tts::stretch_pcm_chunk(&mut stretcher, chunk, rate, false);
                     let level = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
                     env.call_method(&track, "setVolume", "(F)I", &[JValueGen::Float(level)])
                         .map_err(|error| error.to_string())?;
-                    let array = env
-                        .new_short_array(chunk.len() as i32)
-                        .map_err(|error| error.to_string())?;
-                    env.set_short_array_region(&array, 0, chunk)
-                        .map_err(|error| error.to_string())?;
-                    let mut offset = 0;
-                    while offset < chunk.len() {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let written = env
-                            .call_method(
-                                &track,
-                                "write",
-                                "([SII)I",
-                                &[
-                                    JValueGen::Object(array.as_ref()),
-                                    JValueGen::Int(offset as i32),
-                                    JValueGen::Int((chunk.len() - offset) as i32),
-                                ],
-                            )
-                            .and_then(|value| value.i())
-                            .map_err(|error| error.to_string())?;
-                        if written <= 0 {
-                            return Err(format!("AudioTrack write failed: {written}"));
-                        }
-                        offset += written as usize;
-                    }
-                    env.delete_local_ref(array)
-                        .map_err(|error| error.to_string())?;
+                    queued += write_audio_track(env, &track, &pcm, stop)?;
+                }
+                if !stop.load(Ordering::Relaxed) {
+                    let rate = f32::from_bits(speed.load(Ordering::Relaxed));
+                    let tail = crate::tts::stretch_pcm_chunk(&mut stretcher, &[], rate, true);
+                    queued += write_audio_track(env, &track, &tail, stop)?;
                 }
                 // AudioTrack.write only queues PCM; stop() would discard its unplayed tail.
                 let deadline = Instant::now()
@@ -433,12 +418,11 @@ pub fn play_pcm(
                         samples.len() as f64 / sample_rate as f64 / 0.5 + 5.0,
                     );
                 while !stop.load(Ordering::Relaxed) {
-                    update_speed(env)?;
                     let played =
                         env.call_method(&track, "getPlaybackHeadPosition", "()I", &[])
                             .and_then(|value| value.i())
                             .map_err(|error| error.to_string())? as u32;
-                    if played as usize >= samples.len() {
+                    if played as usize >= queued {
                         break;
                     }
                     if Instant::now() >= deadline {
@@ -448,8 +432,7 @@ pub fn play_pcm(
                 }
                 Ok(())
             })();
-            // JNI leaves a pending Java exception after a rejected playback speed.
-            // Clear it before calling stop/release or detaching this Rust thread.
+            // Clear any pending Java exception before stop/release or thread detach.
             if env.exception_check().unwrap_or(false) {
                 let _ = env.exception_clear();
             }
