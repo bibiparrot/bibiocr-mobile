@@ -89,13 +89,13 @@ jobs:
           $aapt = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\aapt.exe'
           $signer = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\apksigner.bat'
           $abi = '${{ matrix.abi }}'
-          $apk = Join-Path 'dist' "bibiocr-mobile-v0.1.0-$abi.apk"
+          $apk = Join-Path 'dist' "bibiocr-mobile-v0.1.1-$abi.apk"
           if (-not (Test-Path $apk)) { throw "Missing $apk" }
           $badging = & $aapt dump badging $apk
           if ($LASTEXITCODE -ne 0 -or -not ($badging -contains "native-code: '$abi'")) {
             throw "Incorrect native ABI in $apk"
           }
-          if (-not ($badging -match "versionCode='16777473'")) {
+          if (-not ($badging -match "versionCode='16777474'")) {
             throw "APK would not upgrade the installed app: $apk"
           }
           $certificate = & $signer verify --print-certs $apk
@@ -108,7 +108,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: bibiocr-apk-${{ matrix.abi }}
-          path: dist/bibiocr-mobile-v0.1.0-${{ matrix.abi }}.apk
+          path: dist/bibiocr-mobile-v0.1.1-${{ matrix.abi }}.apk
           if-no-files-found: error
           retention-days: 14
 

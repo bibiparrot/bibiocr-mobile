@@ -11,8 +11,8 @@ android {
         minSdk 27
         targetSdk 35
         // Keep this above the previously installed cargo-apk versionCode.
-        versionCode 16777473
-        versionName '0.1.0'
+        versionCode 16777474
+        versionName '0.1.1'
     }
 
     sourceSets {

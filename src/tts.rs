@@ -225,11 +225,32 @@ pub fn synthesize_resilient_cached(
     document_dir: &Path,
     stop: &AtomicBool,
 ) -> Result<Vec<Arc<TtsAudio>>, String> {
-    synthesize_resilient_with(sentence, |part| {
-        cached_audio(document_dir, part, || {
-            generate_sentence(part, model_dir, stop)
-        })
+    synthesize_resilient_cached_with(sentence, document_dir, |part| {
+        generate_sentence(part, model_dir, stop)
     })
+}
+
+fn synthesize_resilient_cached_with(
+    sentence: &str,
+    document_dir: &Path,
+    mut generate: impl FnMut(&str) -> Result<Arc<TtsAudio>, String>,
+) -> Result<Vec<Arc<TtsAudio>>, String> {
+    let audio = cached_audio(document_dir, sentence, || {
+        let parts = synthesize_resilient_with(sentence, &mut generate)?;
+        let sample_rate = parts[0].sample_rate;
+        let mut samples = Vec::new();
+        for part in parts {
+            if part.sample_rate != sample_rate {
+                return Err("TTS sample rates differ".to_owned());
+            }
+            samples.extend_from_slice(&part.samples);
+        }
+        Ok(Arc::new(TtsAudio {
+            samples,
+            sample_rate,
+        }))
+    })?;
+    Ok(vec![audio])
 }
 
 fn synthesize_resilient_with<T>(
@@ -398,6 +419,36 @@ pub fn markdown_text(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_audio_is_cached_as_a_complete_sentence() {
+        let root = std::env::temp_dir().join(format!(
+            "bibiocr-tts-fallback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = super::synthesize_resilient_cached_with("hello world", &root, |part| {
+            if part == "hello world" {
+                return Err("Melo TTS failed to generate audio".to_owned());
+            }
+            Ok(std::sync::Arc::new(super::TtsAudio {
+                samples: vec![part.len() as i16],
+                sample_rate: 44_100,
+            }))
+        })
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].samples, [5, 5]);
+        let second = super::synthesize_resilient_cached_with("hello world", &root, |_| {
+            panic!("fallback audio must not be regenerated")
+        })
+        .unwrap();
+        assert_eq!(second[0].samples, [5, 5]);
+        std::fs::remove_file(super::cache_path(&root, "hello world")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn document_audio_is_reused_until_regenerated() {
         let root = std::env::temp_dir().join(format!(
