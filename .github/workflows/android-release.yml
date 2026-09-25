@@ -95,6 +95,9 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not ($badging -contains "native-code: '$abi'")) {
             throw "Incorrect native ABI in $apk"
           }
+          if (-not ($badging -match "versionCode='16777473'")) {
+            throw "APK would not upgrade the installed app: $apk"
+          }
           $certificate = & $signer verify --print-certs $apk
           if ($LASTEXITCODE -ne 0 -or -not ($certificate -contains 'Signer #1 certificate SHA-256 digest: 4ca9f4bbcc644087234912bd967be9b2b68f5d8cd7cf1d77fb1b26a01a47d473')) {
             throw "Incorrect signature in $apk"

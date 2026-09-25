@@ -10,7 +10,8 @@ android {
         applicationId 'com.bibiocr.mobile'
         minSdk 27
         targetSdk 35
-        versionCode 1
+        // Keep this above the previously installed cargo-apk versionCode.
+        versionCode 16777473
         versionName '0.1.0'
     }
 
