@@ -6,7 +6,12 @@ use llama_cpp_2::{
     mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker},
     sampling::LlamaSampler,
 };
-use std::{ffi::CString, num::NonZeroU32, path::Path};
+use std::{
+    ffi::CString,
+    num::NonZeroU32,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub fn recognize(
     model_path: &Path,
@@ -20,9 +25,28 @@ pub fn recognize_stream(
     model_path: &Path,
     mmproj_path: &Path,
     image_path: &Path,
+    on_piece: impl FnMut(&str),
+) -> Result<String, String> {
+    recognize_stream_cancellable(
+        model_path,
+        mmproj_path,
+        image_path,
+        &AtomicBool::new(false),
+        on_piece,
+    )
+}
+
+pub fn recognize_stream_cancellable(
+    model_path: &Path,
+    mmproj_path: &Path,
+    image_path: &Path,
+    cancel: &AtomicBool,
     mut on_piece: impl FnMut(&str),
 ) -> Result<String, String> {
     let _backend_guard = crate::backend_gate::lock()?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Recognition cancelled".to_owned());
+    }
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as i32;
     let backend = LlamaBackend::init().map_err(|error| error.to_string())?;
     let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
@@ -77,6 +101,9 @@ pub fn recognize_stream(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut output = String::new();
     for _ in 0..4096 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Recognition cancelled".to_owned());
+        }
         let token = sampler.sample(&context, -1);
         sampler.accept(token);
         if model.is_eog_token(token) {

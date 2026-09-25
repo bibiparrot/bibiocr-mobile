@@ -392,7 +392,12 @@ fn sentence_chunks(text: &str) -> Vec<String> {
 }
 
 fn push_sentence(chunks: &mut Vec<String>, chunk: &mut String) {
-    if !chunk.trim().is_empty() {
+    if chunk
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count()
+        >= 2
+    {
         chunks.push(chunk.trim().to_owned());
     }
     chunk.clear();
@@ -400,17 +405,24 @@ fn push_sentence(chunks: &mut Vec<String>, chunk: &mut String) {
 
 pub fn markdown_text(markdown: &str) -> String {
     let mut text = String::new();
+    let mut in_image = false;
     for event in pulldown_cmark::Parser::new(markdown) {
         match event {
-            pulldown_cmark::Event::Text(piece) | pulldown_cmark::Event::Code(piece) => {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { .. }) => in_image = true,
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Image) => in_image = false,
+            pulldown_cmark::Event::Text(piece) | pulldown_cmark::Event::Code(piece)
+                if !in_image =>
+            {
                 text.push_str(&piece);
             }
-            pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => text.push('\n'),
+            pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak if !in_image => {
+                text.push('\n');
+            }
             pulldown_cmark::Event::End(
                 pulldown_cmark::TagEnd::Paragraph
                 | pulldown_cmark::TagEnd::Heading(_)
                 | pulldown_cmark::TagEnd::Item,
-            ) => text.push_str("\n\n"),
+            ) if !text.ends_with('\n') => text.push_str("\n\n"),
             _ => {}
         }
     }
@@ -580,6 +592,10 @@ mod tests {
             super::markdown_text("# Hello\n\n**world** [link](https://example.com)"),
             "Hello\n\nworld link"
         );
+        assert_eq!(
+            super::markdown_text("前文\n\n![Image](imgs/crop.jpg)\n\n后文"),
+            "前文\n\n后文"
+        );
     }
 
     #[test]
@@ -610,6 +626,14 @@ mod tests {
         assert_eq!(
             super::sentences(&format!("{long_line}\n继续。")),
             [long_line.clone(), "继续。".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unreadable_leading_ocr_noise_does_not_block_later_sentences() {
+        assert_eq!(
+            super::sentences("O\n0\n△○□\n安全提示\n后面的文字可以朗读。"),
+            ["安全提示", "后面的文字可以朗读。"]
         );
     }
 

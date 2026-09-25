@@ -1,3 +1,4 @@
+use crate::settings::OcrEngine;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -24,6 +25,12 @@ pub struct ScanRecord {
     pub stage: ScanStage,
     #[serde(default)]
     pub tts_revision: u64,
+    #[serde(default = "legacy_ocr_engine")]
+    pub ocr_engine: OcrEngine,
+}
+
+fn legacy_ocr_engine() -> OcrEngine {
+    OcrEngine::PaddleVl16
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -62,6 +69,7 @@ pub fn add_result(records: &mut Vec<ScanRecord>, id: u64, image_path: PathBuf, m
             markdown,
             stage: ScanStage::Complete,
             tts_revision: 0,
+            ocr_engine: OcrEngine::PaddleV6,
         },
     );
 }
@@ -77,7 +85,12 @@ fn result_title(markdown: &str) -> String {
         .collect()
 }
 
-pub fn add_pending(records: &mut Vec<ScanRecord>, id: u64, image_path: PathBuf) {
+pub fn add_pending(
+    records: &mut Vec<ScanRecord>,
+    id: u64,
+    image_path: PathBuf,
+    ocr_engine: OcrEngine,
+) {
     let title = image_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -92,6 +105,7 @@ pub fn add_pending(records: &mut Vec<ScanRecord>, id: u64, image_path: PathBuf) 
             markdown: String::new(),
             stage: ScanStage::Captured,
             tts_revision: 0,
+            ocr_engine,
         },
     );
 }
@@ -130,6 +144,7 @@ pub fn matches_query(record: &ScanRecord, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ScanRecord, ScanStage, add_result, load, matches_query, remove, save};
+    use crate::settings::OcrEngine;
 
     #[test]
     fn search_finds_document_text_and_image_name() {
@@ -141,6 +156,7 @@ mod tests {
             markdown: "# Notes\n\n合同金额 10 元".to_owned(),
             stage: ScanStage::Complete,
             tts_revision: 0,
+            ocr_engine: OcrEngine::PaddleV6,
         };
         assert!(matches_query(&record, "quarterly"));
         assert!(matches_query(&record, "合同金额"));
@@ -186,7 +202,12 @@ mod tests {
         ));
         let path = root.join("history.toml");
         let mut records = Vec::new();
-        super::add_pending(&mut records, 17, root.join("photo.jpg"));
+        super::add_pending(
+            &mut records,
+            17,
+            root.join("photo.jpg"),
+            OcrEngine::PaddleV6,
+        );
         save(&path, &records).unwrap();
         let mut restored = load(&path);
         assert_eq!(restored[0].stage, ScanStage::Captured);
@@ -215,5 +236,15 @@ markdown = "# Old"
         let records: super::HistoryFile = toml::from_str(text).unwrap();
         assert_eq!(records.records[0].stage, ScanStage::Complete);
         assert_eq!(records.records[0].tts_revision, 0);
+        assert_eq!(records.records[0].ocr_engine, OcrEngine::PaddleVl16);
+    }
+
+    #[test]
+    fn pending_scan_remembers_which_ocr_engine_was_selected() {
+        let mut records = Vec::new();
+        super::add_pending(&mut records, 42, "photo.jpg".into(), OcrEngine::PaddleV6);
+        let saved = toml::to_string(&super::HistoryFile { records }).unwrap();
+        let restored: super::HistoryFile = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.records[0].ocr_engine, OcrEngine::PaddleV6);
     }
 }

@@ -70,46 +70,44 @@ pub fn system_insets_px() -> Result<Option<crate::core::SystemInsetsPx>, String>
 
 pub fn is_wifi_connected() -> Result<bool, String> {
     robius_android_env::with_activity(|env, activity| {
-        let name = env
-            .new_string("connectivity")
-            .map_err(|error| error.to_string())?;
-        let name = JObject::from(name);
-        let manager = env
-            .call_method(
-                activity,
-                "getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-                &[JValueGen::Object(&name)],
-            )
-            .and_then(|value| value.l())
-            .map_err(|error| error.to_string())?;
-        if manager.is_null() {
-            return Ok(false);
-        }
-        let network = env
-            .call_method(&manager, "getActiveNetwork", "()Landroid/net/Network;", &[])
-            .and_then(|value| value.l())
-            .map_err(|error| error.to_string())?;
-        if network.is_null() {
-            return Ok(false);
-        }
-        let capabilities = env
-            .call_method(
-                &manager,
-                "getNetworkCapabilities",
-                "(Landroid/net/Network;)Landroid/net/NetworkCapabilities;",
-                &[JValueGen::Object(&network)],
-            )
-            .and_then(|value| value.l())
-            .map_err(|error| error.to_string())?;
-        if capabilities.is_null() {
-            return Ok(false);
-        }
-        env.call_method(&capabilities, "hasTransport", "(I)Z", &[JValueGen::Int(1)])
-            .and_then(|value| value.z())
+        env.with_local_frame(32, |env| read_wifi_connected(env, activity))
             .map_err(|error| error.to_string())
     })
     .map_err(|error| error.to_string())?
+}
+
+fn read_wifi_connected(env: &mut JNIEnv<'_>, activity: &JObject<'_>) -> jni::errors::Result<bool> {
+    let name = JObject::from(env.new_string("connectivity")?);
+    let manager = env
+        .call_method(
+            activity,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValueGen::Object(&name)],
+        )?
+        .l()?;
+    if manager.is_null() {
+        return Ok(false);
+    }
+    let network = env
+        .call_method(&manager, "getActiveNetwork", "()Landroid/net/Network;", &[])?
+        .l()?;
+    if network.is_null() {
+        return Ok(false);
+    }
+    let capabilities = env
+        .call_method(
+            &manager,
+            "getNetworkCapabilities",
+            "(Landroid/net/Network;)Landroid/net/NetworkCapabilities;",
+            &[JValueGen::Object(&network)],
+        )?
+        .l()?;
+    if capabilities.is_null() {
+        return Ok(false);
+    }
+    env.call_method(&capabilities, "hasTransport", "(I)Z", &[JValueGen::Int(1)])?
+        .z()
 }
 
 fn read_system_insets(
@@ -441,6 +439,7 @@ pub fn play_pcm(
             if env.exception_check().unwrap_or(false) {
                 let _ = env.exception_clear();
             }
+            let _ = env.delete_local_ref(track);
             result
         })();
         if env.exception_check().unwrap_or(false) {

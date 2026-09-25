@@ -9,8 +9,10 @@ pub mod download;
 pub mod export;
 pub mod history;
 pub mod layout;
+pub mod markdown;
 pub mod mobile;
 #[cfg(target_os = "android")]
 pub mod recognizer;
 pub mod settings;
 pub mod tts;
+pub mod v6;

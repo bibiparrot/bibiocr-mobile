@@ -4,7 +4,7 @@ use crate::{
     core::{self, MODELS},
     download::{self, DownloadEvent, DownloadTask},
     history::{self, ScanRecord, ScanStage},
-    settings::{DownloadSettings, LocaleManager, Settings},
+    settings::{DownloadSettings, LocaleManager, OcrEngine, Settings},
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Margin, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -67,7 +67,6 @@ enum Icon {
     Camera,
     Gallery,
     Download,
-    Pause,
     Trash,
 }
 
@@ -89,7 +88,7 @@ enum StepState {
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 enum AppEvent {
     Image(Result<Option<PathBuf>, String>),
-    OriginalImage(PathBuf, Result<([usize; 2], Vec<u8>), String>),
+    OriginalImage(PathBuf, Result<([usize; 2], [usize; 2], Vec<u8>), String>),
     TextInput(TextTarget, Result<Option<String>, String>),
     Notice(Result<String, String>),
     TtsSentence(usize),
@@ -123,12 +122,15 @@ pub struct MobileApp {
     current_image: Option<PathBuf>,
     current_record_id: Option<u64>,
     original_texture: Option<egui::TextureHandle>,
+    original_size: Option<[usize; 2]>,
     original_loading: bool,
     text_dialog_open: bool,
     app_events: Receiver<AppEvent>,
     app_sender: Sender<AppEvent>,
-    recognition_events: Receiver<RecognitionEvent>,
-    recognition_sender: Sender<RecognitionEvent>,
+    recognition_events: Receiver<(u64, RecognitionEvent)>,
+    recognition_sender: Sender<(u64, RecognitionEvent)>,
+    recognition_generation: u64,
+    recognition_cancel: Arc<AtomicBool>,
     notice: Option<String>,
     camera_open: bool,
     download_task: Option<DownloadTask>,
@@ -136,6 +138,8 @@ pub struct MobileApp {
     model_status: [ModelStatus; MODELS.len()],
     download_error: Option<String>,
     download_settings: DownloadSettings,
+    ocr_engine: OcrEngine,
+    download_view_engine: OcrEngine,
     locale: &'static str,
     language_choice: String,
     tts_active: bool,
@@ -178,11 +182,13 @@ impl MobileApp {
         let download_settings = settings.download;
         let model_dir =
             configured_data.map_or_else(|| data_dir.join("downloads"), |path| path.join("models"));
-        let first_screen = if core::initial_screen(&model_dir) == core::Screen::Download {
-            Screen::Download
-        } else {
-            Screen::History
-        };
+        download::cleanup_obsolete_layout(&model_dir);
+        let first_screen =
+            if core::initial_screen(&model_dir, settings.ocr_engine) == core::Screen::Download {
+                Screen::Download
+            } else {
+                Screen::History
+            };
         let model_status = std::array::from_fn(|index| {
             if download::installed(&model_dir, &MODELS[index]) {
                 ModelStatus::Complete
@@ -199,7 +205,14 @@ impl MobileApp {
         });
         let download_task = (first_screen == Screen::Download
             && std::env::var_os("BIBIOCR_SKIP_DOWNLOAD").is_none())
-        .then(|| download::start(model_dir.clone(), download_settings.clone(), locale));
+        .then(|| {
+            download::start(
+                model_dir.clone(),
+                download_settings.clone(),
+                locale,
+                settings.ocr_engine,
+            )
+        });
         let history_path = data_dir.join("history.toml");
         let records = history::load(&history_path);
         let (app_sender, app_events) = mpsc::channel();
@@ -221,12 +234,15 @@ impl MobileApp {
             current_image: None,
             current_record_id: None,
             original_texture: None,
+            original_size: None,
             original_loading: false,
             text_dialog_open: false,
             app_events,
             app_sender,
             recognition_events,
             recognition_sender,
+            recognition_generation: 0,
+            recognition_cancel: Arc::new(AtomicBool::new(false)),
             notice: None,
             camera_open: false,
             download_task,
@@ -234,6 +250,8 @@ impl MobileApp {
             model_status,
             download_error: None,
             download_settings,
+            ocr_engine: settings.ocr_engine,
+            download_view_engine: settings.ocr_engine,
             locale,
             language_choice,
             tts_active: false,
@@ -300,6 +318,7 @@ impl MobileApp {
                     self.camera_open = false;
                     self.current_image = Some(path);
                     self.original_texture = None;
+                    self.original_size = None;
                     self.original_loading = false;
                     self.start_recognition();
                 }
@@ -309,7 +328,8 @@ impl MobileApp {
                     }
                     self.original_loading = false;
                     match result {
-                        Ok((size, pixels)) => {
+                        Ok((original_size, size, pixels)) => {
+                            self.original_size = Some(original_size);
                             self.original_texture = Some(ctx.load_texture(
                                 "ocr-original",
                                 egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
@@ -379,8 +399,12 @@ impl MobileApp {
         }
 
         let events: Vec<_> = self.recognition_events.try_iter().collect();
-        for event in events {
-            if !self.recognition_active {
+        for (generation, event) in events {
+            if !accept_recognition_event(
+                self.recognition_active,
+                self.recognition_generation,
+                generation,
+            ) {
                 continue;
             }
             match event {
@@ -388,9 +412,13 @@ impl MobileApp {
                 RecognitionEvent::Ocr => {
                     self.recognition_progress = 0.65;
                     if let Some(id) = self.current_record_id {
-                        history::set_stage(&mut self.records, id, ScanStage::LayoutDone);
-                        if let Err(error) = history::save(&self.history_path, &self.records) {
-                            self.notice = Some(error);
+                        if self.records.iter().any(|record| {
+                            record.id == id && record.ocr_engine == OcrEngine::PaddleVl16
+                        }) {
+                            history::set_stage(&mut self.records, id, ScanStage::LayoutDone);
+                            if let Err(error) = history::save(&self.history_path, &self.records) {
+                                self.notice = Some(error);
+                            }
                         }
                     }
                 }
@@ -401,7 +429,7 @@ impl MobileApp {
                 RecognitionEvent::Complete(markdown) => {
                     self.recognition_active = false;
                     self.recognition_progress = 1.0;
-                    self.markdown = markdown;
+                    self.markdown = crate::markdown::normalize_ocr(&markdown);
                     self.recognition_text.clear();
                     self.result_tab = ResultTab::Preview;
                     if let Some(id) = self.current_record_id {
@@ -501,15 +529,17 @@ impl MobileApp {
         let Some(image) = self.current_image.clone() else {
             return;
         };
-        let stage = self.current_record_id.and_then(|id| {
+        let existing = self.current_record_id.and_then(|id| {
             self.records
                 .iter()
                 .find(|record| record.id == id && record.image_path == image)
-                .map(|record| record.stage)
+                .map(|record| (record.stage, record.ocr_engine))
         });
+        let stage = existing.map(|(stage, _)| stage);
+        let engine = existing.map_or(self.ocr_engine, |(_, engine)| engine);
         if stage.is_none() || stage == Some(ScanStage::Complete) {
             let id = now_id();
-            history::add_pending(&mut self.records, id, image.clone());
+            history::add_pending(&mut self.records, id, image.clone(), self.ocr_engine);
             self.current_record_id = Some(id);
             if let Err(error) = history::save(&self.history_path, &self.records) {
                 self.recognition_error = Some(error);
@@ -521,50 +551,104 @@ impl MobileApp {
         self.recognition_progress = 0.1;
         self.recognition_text.clear();
         self.recognition_error = None;
+        let missing = core::required_models(engine)
+            .filter(|(_, model)| model.group != core::ModelGroup::Shared)
+            .any(|(_, model)| !download::installed(&self.model_dir, model));
+        if missing {
+            self.recognition_active = false;
+            self.screen = Screen::Download;
+            if self.download_task.is_none() {
+                self.download_task = Some(download::start(
+                    self.model_dir.clone(),
+                    self.download_settings.clone(),
+                    self.locale,
+                    engine,
+                ));
+            }
+            return;
+        }
         self.recognition_active = true;
+        self.recognition_cancel.store(true, Ordering::Relaxed);
+        self.recognition_cancel = Arc::new(AtomicBool::new(false));
+        self.recognition_generation = self.recognition_generation.wrapping_add(1);
+        let generation = self.recognition_generation;
+        let cancel = Arc::clone(&self.recognition_cancel);
         let model_dir = self.model_dir.clone();
         let sender = self.recognition_sender.clone();
         #[cfg(target_os = "android")]
         std::thread::spawn(move || {
             let _wake_lock = crate::android_bridge::OcrWakeLock::acquire().ok();
+            let emit = |event| sender.send((generation, event));
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if engine == OcrEngine::PaddleV6 {
+                let _ = emit(RecognitionEvent::Layout);
+                let _ = emit(RecognitionEvent::Ocr);
+                match crate::v6::recognize_cancellable(&model_dir, &image, &cancel) {
+                    Ok(markdown) if !markdown.trim().is_empty() => {
+                        let _ = emit(RecognitionEvent::Complete(markdown));
+                    }
+                    Ok(_) => {
+                        let _ = emit(RecognitionEvent::Failed("OCR returned no text".to_owned()));
+                    }
+                    Err(error) => {
+                        let _ = emit(RecognitionEvent::Failed(error));
+                    }
+                }
+                return;
+            }
             if stage != Some(ScanStage::LayoutDone) {
-                let _ = sender.send(RecognitionEvent::Layout);
+                let _ = emit(RecognitionEvent::Layout);
                 if let Err(error) =
                     crate::layout::analyze(&model_dir.join(MODELS[2].file_name), &image)
                 {
-                    let _ = sender.send(RecognitionEvent::Failed(error));
+                    let _ = emit(RecognitionEvent::Failed(error));
                     return;
                 }
             }
-            let _ = sender.send(RecognitionEvent::Ocr);
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = emit(RecognitionEvent::Ocr);
             let stream = sender.clone();
-            match crate::recognizer::recognize_stream(
+            match crate::recognizer::recognize_stream_cancellable(
                 &model_dir.join(MODELS[0].file_name),
                 &model_dir.join(MODELS[1].file_name),
                 &image,
+                &cancel,
                 move |piece| {
-                    let _ = stream.send(RecognitionEvent::Token(piece.to_owned()));
+                    let _ = stream.send((generation, RecognitionEvent::Token(piece.to_owned())));
                 },
             ) {
                 Ok(markdown) if !markdown.is_empty() => {
-                    let _ = sender.send(RecognitionEvent::Complete(markdown));
+                    let _ = emit(RecognitionEvent::Complete(markdown));
                 }
                 Ok(_) => {
-                    let _ =
-                        sender.send(RecognitionEvent::Failed("OCR returned no text".to_owned()));
+                    let _ = emit(RecognitionEvent::Failed("OCR returned no text".to_owned()));
                 }
                 Err(error) => {
-                    let _ = sender.send(RecognitionEvent::Failed(error));
+                    let _ = emit(RecognitionEvent::Failed(error));
                 }
             }
         });
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (image, model_dir, stage);
-            let _ = sender.send(RecognitionEvent::Failed(
-                "On-device OCR is available in the Android build".to_owned(),
+            let _ = (image, model_dir, stage, engine, cancel);
+            let _ = sender.send((
+                generation,
+                RecognitionEvent::Failed(
+                    "On-device OCR is available in the Android build".to_owned(),
+                ),
             ));
         }
+    }
+
+    fn cancel_recognition(&mut self) {
+        self.recognition_cancel.store(true, Ordering::Relaxed);
+        self.recognition_active = false;
+        self.recognition_text.clear();
+        self.screen = Screen::History;
     }
 
     fn open_record(&mut self, record: ScanRecord) {
@@ -576,11 +660,24 @@ impl MobileApp {
         self.tts_active = false;
         self.tts_current = None;
         self.tts_preparing = false;
+        if record.stage != ScanStage::Complete && record.ocr_engine != self.ocr_engine {
+            self.set_ocr_engine(record.ocr_engine);
+            if record.ocr_engine != self.ocr_engine {
+                return;
+            }
+        }
         self.current_record_id = Some(record.id);
         self.current_image = Some(record.image_path);
         self.original_texture = None;
+        self.original_size = None;
         self.original_loading = false;
-        self.markdown = record.markdown;
+        self.markdown = crate::markdown::normalize_ocr(&record.markdown);
+        if self.markdown != record.markdown {
+            history::complete(&mut self.records, record.id, self.markdown.clone());
+            if let Err(error) = history::save(&self.history_path, &self.records) {
+                self.notice = Some(error);
+            }
+        }
         self.result_tab = ResultTab::Preview;
         if record.stage == ScanStage::Complete {
             self.screen = Screen::Result;
@@ -679,19 +776,29 @@ impl MobileApp {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    generated += 1;
                     let _ = sender.send(AppEvent::TtsSentence(index));
+                    #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+                    let mut playback_failed = false;
                     for piece in audio {
                         #[cfg(target_os = "android")]
-                        crate::android_bridge::play_pcm(
+                        if let Err(error) = crate::android_bridge::play_pcm(
                             &piece.samples,
                             piece.sample_rate,
                             &volume,
                             &playback_speed,
                             &stop,
-                        )?;
+                        ) {
+                            eprintln!("TTS segment {index} playback failed: {error}");
+                            playback_failed = true;
+                            break;
+                        }
                         #[cfg(not(target_os = "android"))]
                         let _ = (&piece, &volume, &playback_speed);
+                    }
+                    if playback_failed {
+                        skipped += 1;
+                    } else {
+                        generated += 1;
                     }
                     let _ = sender.send(AppEvent::TtsSentenceDone(index));
                 }
@@ -716,7 +823,7 @@ impl MobileApp {
         if self.tts_active {
             return;
         }
-        if !MODELS[3..]
+        if !MODELS[3..6]
             .iter()
             .all(|model| download::installed(&self.model_dir, model))
         {
@@ -865,7 +972,6 @@ impl MobileApp {
                 }
                 DownloadEvent::Finished => {
                     self.download_task = None;
-                    self.screen = Screen::History;
                 }
             }
         }
@@ -873,12 +979,18 @@ impl MobileApp {
 
     fn download_screen(&mut self, ui: &mut egui::Ui, entered: bool) {
         self.poll_downloads();
-        let missing = MODELS
-            .iter()
+        if entered {
+            self.download_view_engine = self.ocr_engine;
+        }
+        let required = core::required_models(self.download_view_engine).collect::<Vec<_>>();
+        let missing = core::required_models(self.ocr_engine)
+            .map(|(_, model)| model)
             .any(|model| !download::installed(&self.model_dir, model));
         let check_wifi = entered && self.download_task.is_none() && missing;
         #[cfg(target_os = "android")]
-        let on_wifi = check_wifi && crate::android_bridge::is_wifi_connected().unwrap_or(false);
+        let on_wifi = check_wifi
+            && (!self.download_settings.wifi_only
+                || crate::android_bridge::is_wifi_connected().unwrap_or(false));
         #[cfg(not(target_os = "android"))]
         let on_wifi = check_wifi;
         if should_auto_resume_download(entered, self.download_task.is_some(), missing, on_wifi)
@@ -889,18 +1001,23 @@ impl MobileApp {
                 self.model_dir.clone(),
                 self.download_settings.clone(),
                 self.locale,
+                self.ocr_engine,
             ));
         }
         let title = rust_i18n::t!("mobile_download_title").into_owned();
-        let (back, pause) = top_bar(ui, &title, true, Some(Icon::Pause), INK, CHIP);
+        let (back, settings) = top_bar(ui, &title, true, Some(Icon::Gear), INK, CHIP);
         if back {
             self.screen = Screen::History;
             return;
         }
-        if pause {
-            if let Some(task) = &self.download_task {
-                task.toggle_pause();
-            }
+        if settings {
+            self.screen = Screen::Settings;
+            return;
+        }
+        if let Some(engine) = engine_picker(ui, self.download_view_engine, "mobile_download_view") {
+            self.download_view_engine = engine;
+            ui.ctx().request_repaint();
+            return;
         }
         let content_height = (ui.available_height() - 74.0).max(0.0);
         ui.allocate_ui_with_layout(
@@ -908,42 +1025,25 @@ impl MobileApp {
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 download_scroll_area().show(ui, |ui| {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(18.0);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    rust_i18n::t!("mobile_download_first").into_owned(),
-                                )
-                                .size(18.0)
-                                .strong()
-                                .color(INK),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    rust_i18n::t!("mobile_download_once").into_owned(),
-                                )
-                                .size(12.0)
-                                .color(MUTED),
-                            );
-                        });
-                    });
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
-                    let downloaded: u64 = self.model_progress.iter().map(|value| value.0).sum();
-                    let total: u64 = MODELS.iter().map(|model| model.expected_bytes).sum();
+                    let downloaded: u64 = required
+                        .iter()
+                        .map(|(index, _)| self.model_progress[*index].0)
+                        .sum();
+                    let total: u64 = required.iter().map(|(_, model)| model.expected_bytes).sum();
                     let overall = downloaded as f32 / total as f32;
                     let mut retry = false;
+                    let mut pause_clicked = false;
                     egui::Frame::default()
                         .fill(CARD)
                         .corner_radius(CornerRadius::same(14))
-                        .inner_margin(Margin::same(12))
+                        .inner_margin(Margin::same(9))
                         .outer_margin(Margin {
                             left: 16,
                             right: 16,
                             top: 0,
-                            bottom: 6,
+                            bottom: 4,
                         })
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -957,6 +1057,22 @@ impl MobileApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        pause_clicked = ui
+                                            .add_enabled(
+                                                self.download_task.is_some(),
+                                                egui::Button::new(
+                                                    if self
+                                                        .download_task
+                                                        .as_ref()
+                                                        .is_some_and(DownloadTask::is_paused)
+                                                    {
+                                                        "▶"
+                                                    } else {
+                                                        "Ⅱ"
+                                                    },
+                                                ),
+                                            )
+                                            .clicked();
                                         ui.label(
                                             egui::RichText::new(format!("{:.0}%", overall * 100.0))
                                                 .size(14.0)
@@ -983,9 +1099,9 @@ impl MobileApp {
                             ui.add_space(5.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} / {} MB",
-                                    downloaded / 1_000_000,
-                                    total / 1_000_000
+                                    "{} / {}",
+                                    format_bytes(downloaded),
+                                    format_bytes(total)
                                 ))
                                 .size(13.0)
                                 .color(MUTED),
@@ -997,16 +1113,22 @@ impl MobileApp {
                                     .clicked();
                             }
                         });
+                    if pause_clicked {
+                        if let Some(task) = &self.download_task {
+                            task.toggle_pause();
+                        }
+                    }
                     if retry {
                         self.download_error = None;
                         self.download_task = Some(download::start(
                             self.model_dir.clone(),
                             self.download_settings.clone(),
                             self.locale,
+                            self.ocr_engine,
                         ));
                     }
 
-                    for (index, model) in MODELS.iter().enumerate() {
+                    for &(index, model) in &required {
                         let (downloaded, total) = self.model_progress[index];
                         let fraction = if total == 0 {
                             0.0
@@ -1016,20 +1138,20 @@ impl MobileApp {
                         egui::Frame::default()
                             .fill(CARD)
                             .corner_radius(CornerRadius::same(14))
-                            .inner_margin(Margin::same(12))
+                            .inner_margin(Margin::same(8))
                             .outer_margin(Margin {
                                 left: 16,
                                 right: 16,
                                 top: 0,
-                                bottom: 6,
+                                bottom: 4,
                             })
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.add_sized(
-                                        [ui.available_width() - 68.0, 22.0],
+                                        [ui.available_width() - 68.0, 18.0],
                                         egui::Label::new(
                                             egui::RichText::new(model.file_name)
-                                                .size(12.0)
+                                                .size(11.0)
                                                 .strong()
                                                 .color(INK),
                                         )
@@ -1056,23 +1178,23 @@ impl MobileApp {
                                                 egui::RichText::new(
                                                     rust_i18n::t!(key).into_owned(),
                                                 )
-                                                .size(12.0)
+                                                .size(11.0)
                                                 .color(color),
                                             );
                                         },
                                     );
                                 });
-                                ui.add_space(4.0);
+                                ui.add_space(2.0);
                                 progress_bar(ui, ui.available_width(), fraction);
-                                ui.add_space(4.0);
+                                ui.add_space(2.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "{} / {} MB",
-                                            downloaded / 1_000_000,
-                                            model.expected_bytes / 1_000_000
+                                            "{} / {}",
+                                            format_bytes(downloaded),
+                                            format_bytes(model.expected_bytes)
                                         ))
-                                        .size(13.0)
+                                        .size(11.0)
                                         .color(MUTED),
                                     );
                                     ui.with_layout(
@@ -1083,7 +1205,7 @@ impl MobileApp {
                                                     "{:.0}%",
                                                     fraction * 100.0
                                                 ))
-                                                .size(13.0)
+                                                .size(11.0)
                                                 .strong()
                                                 .color(INK),
                                             );
@@ -1112,6 +1234,11 @@ impl MobileApp {
             Pos2::new(left.right() + 12.0, left.top()),
             Vec2::new(width, 50.0),
         );
+        let wifi_response = ui.interact(left, Id::new("download_wifi_only"), Sense::click());
+        if self.download_settings.wifi_only {
+            ui.painter()
+                .rect_filled(left, CornerRadius::same(14), ORANGE_SOFT);
+        }
         ui.painter().rect_stroke(
             left,
             CornerRadius::same(14),
@@ -1121,7 +1248,15 @@ impl MobileApp {
         ui.painter().text(
             left.center(),
             Align2::CENTER_CENTER,
-            rust_i18n::t!("mobile_wifi_only").into_owned(),
+            format!(
+                "{}{}",
+                rust_i18n::t!("mobile_wifi_only"),
+                if self.download_settings.wifi_only {
+                    " ✓"
+                } else {
+                    ""
+                }
+            ),
             FontId::proportional(15.0),
             INK,
         );
@@ -1137,6 +1272,9 @@ impl MobileApp {
         );
         if response.clicked() {
             self.screen = Screen::History;
+        }
+        if wifi_response.clicked() {
+            self.set_wifi_only(!self.download_settings.wifi_only);
         }
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
@@ -1157,6 +1295,72 @@ impl MobileApp {
         self.notice = None;
     }
 
+    fn set_wifi_only(&mut self, enabled: bool) {
+        let path = self.data_dir.join("settings.toml");
+        let mut settings = Settings::load_or_default(&path);
+        settings.download.wifi_only = enabled;
+        if let Err(error) = settings.save(&path) {
+            self.notice = Some(error);
+            return;
+        }
+        self.download_settings.wifi_only = enabled;
+        if let Some(task) = self.download_task.take() {
+            task.cancel();
+        }
+        if core::required_models(self.ocr_engine)
+            .any(|(_, model)| !download::installed(&self.model_dir, model))
+        {
+            self.download_task = Some(download::start(
+                self.model_dir.clone(),
+                self.download_settings.clone(),
+                self.locale,
+                self.ocr_engine,
+            ));
+        }
+    }
+
+    fn set_ocr_engine(&mut self, engine: OcrEngine) {
+        if self.ocr_engine == engine {
+            return;
+        }
+        let path = self.data_dir.join("settings.toml");
+        let mut settings = Settings::load_or_default(&path);
+        settings.ocr_engine = engine;
+        if let Err(error) = settings.save(&path) {
+            self.notice = Some(error);
+            return;
+        }
+        if let Some(task) = self.download_task.take() {
+            task.cancel();
+        }
+        self.ocr_engine = engine;
+        self.download_view_engine = engine;
+        self.download_error = None;
+        for (index, model) in MODELS.iter().enumerate() {
+            let complete = download::installed(&self.model_dir, model);
+            self.model_status[index] = if complete {
+                ModelStatus::Complete
+            } else {
+                ModelStatus::Waiting
+            };
+            self.model_progress[index] = (
+                if complete { model.expected_bytes } else { 0 },
+                model.expected_bytes,
+            );
+        }
+        if core::initial_screen(&self.model_dir, engine) == core::Screen::Download {
+            self.screen = Screen::Download;
+            self.download_task = Some(download::start(
+                self.model_dir.clone(),
+                self.download_settings.clone(),
+                self.locale,
+                engine,
+            ));
+        } else if self.screen == Screen::Download {
+            self.screen = Screen::History;
+        }
+    }
+
     fn settings_screen(&mut self, ui: &mut egui::Ui) {
         let (back, _) = top_bar(
             ui,
@@ -1168,6 +1372,12 @@ impl MobileApp {
         );
         if back {
             self.screen = Screen::History;
+            return;
+        }
+        ui.add_space(12.0);
+        if let Some(engine) = engine_picker(ui, self.ocr_engine, "mobile_ocr_engine") {
+            self.set_ocr_engine(engine);
+            ui.ctx().request_repaint();
             return;
         }
         ui.add_space(12.0);
@@ -1268,7 +1478,7 @@ impl MobileApp {
             .collect();
         let mut open = None;
         let mut delete = None;
-        let list_height = (ui.clip_rect().bottom() - ui.cursor().top() - 66.0).max(0.0);
+        let list_height = (ui.clip_rect().bottom() - ui.cursor().top() - 54.0).max(0.0);
         egui::ScrollArea::vertical()
             .max_height(list_height)
             .show(ui, |ui| {
@@ -1286,23 +1496,26 @@ impl MobileApp {
                     let response = egui::Frame::default()
                         .fill(CARD)
                         .corner_radius(CornerRadius::same(16))
-                        .inner_margin(Margin::same(12))
+                        .inner_margin(Margin::same(8))
                         .outer_margin(Margin {
                             left: 16,
                             right: 16,
                             top: 0,
-                            bottom: 10,
+                            bottom: 5,
                         })
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.vertical(|ui| {
-                                    ui.set_min_width((ui.available_width() - 42.0).max(120.0));
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(&record.title)
-                                            .size(16.0)
-                                            .strong()
-                                            .color(INK),
+                                    ui.set_min_width((ui.available_width() - 34.0).max(120.0));
+                                    ui.add_space(1.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&record.title)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(INK),
+                                        )
+                                        .truncate(),
                                     );
                                     if record.stage == ScanStage::Complete {
                                         let file = record
@@ -1310,27 +1523,42 @@ impl MobileApp {
                                             .file_name()
                                             .and_then(|name| name.to_str())
                                             .unwrap_or("image");
-                                        ui.label(egui::RichText::new(file).size(13.0).color(MUTED));
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "{} · {}",
+                                                    record.ocr_engine.label(),
+                                                    file
+                                                ))
+                                                .size(11.0)
+                                                .color(MUTED),
+                                            )
+                                            .truncate(),
+                                        );
                                     } else {
                                         let step = if record.stage == ScanStage::LayoutDone {
                                             "mobile_step_ocr"
                                         } else {
                                             "mobile_step_layout"
                                         };
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} · {}",
-                                                rust_i18n::t!("mobile_resume_scan"),
-                                                rust_i18n::t!(step)
-                                            ))
-                                            .size(13.0)
-                                            .color(ORANGE),
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "{} · {} · {}",
+                                                    record.ocr_engine.label(),
+                                                    rust_i18n::t!("mobile_resume_scan"),
+                                                    rust_i18n::t!(step)
+                                                ))
+                                                .size(11.0)
+                                                .color(ORANGE),
+                                            )
+                                            .truncate(),
                                         );
                                     }
                                 });
                                 let (trash, response) =
-                                    ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
-                                paint_icon(ui.painter(), trash.shrink(9.0), Icon::Trash, MUTED);
+                                    ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+                                paint_icon(ui.painter(), trash.shrink(7.0), Icon::Trash, MUTED);
                                 if response.clicked() {
                                     delete = Some(record.id);
                                 }
@@ -1341,7 +1569,7 @@ impl MobileApp {
                         open = Some(record.clone());
                     }
                 }
-                ui.add_space(82.0);
+                ui.add_space(60.0);
             });
         if let Some(id) = delete {
             if history::remove(&mut self.records, id)
@@ -1357,7 +1585,7 @@ impl MobileApp {
         // Keep actions above the scroll layer so visible buttons receive taps.
         let panel = ui.clip_rect();
         let bar = Rect::from_min_max(
-            Pos2::new(panel.left(), panel.bottom() - 66.0),
+            Pos2::new(panel.left(), panel.bottom() - 54.0),
             panel.right_bottom(),
         );
         let mut action = None;
@@ -1382,7 +1610,7 @@ impl MobileApp {
                         ),
                     ] {
                         let (rect, response) =
-                            ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click());
                         if index != 0 {
                             ui.painter()
                                 .rect_filled(rect, CornerRadius::same(14), color);
@@ -1421,7 +1649,7 @@ impl MobileApp {
             CHIP,
         );
         if back || close {
-            self.screen = Screen::History;
+            self.cancel_recognition();
             return;
         }
 
@@ -1489,6 +1717,7 @@ impl MobileApp {
         }
 
         ui.add_space(20.0);
+        let mut cancel = false;
         ui.horizontal(|ui| {
             ui.add_space(20.0);
             ui.label(
@@ -1496,6 +1725,13 @@ impl MobileApp {
                     .size(14.0)
                     .color(INK),
             );
+            if self.recognition_active
+                && ui
+                    .button(rust_i18n::t!("mobile_cancel_ocr").into_owned())
+                    .clicked()
+            {
+                cancel = true;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(20.0);
                 ui.label(
@@ -1506,6 +1742,10 @@ impl MobileApp {
                 );
             });
         });
+        if cancel {
+            self.cancel_recognition();
+            return;
+        }
         ui.horizontal(|ui| {
             ui.add_space(20.0);
             progress_bar(ui, ui.available_width() - 20.0, self.recognition_progress);
@@ -1554,8 +1794,10 @@ impl MobileApp {
             let result = image::open(&path)
                 .map_err(|error| error.to_string())
                 .map(|image| {
+                    let original_size = [image.width() as usize, image.height() as usize];
                     let image = image.thumbnail(1600, 1600).to_rgba8();
                     (
+                        original_size,
                         [image.width() as usize, image.height() as usize],
                         image.into_raw(),
                     )
@@ -1691,10 +1933,12 @@ impl MobileApp {
                 .store(self.tts_volume.to_bits(), Ordering::Relaxed);
         });
 
-        if self.result_tab == ResultTab::Compare {
+        if self.result_tab == ResultTab::Compare
+            || (self.result_tab == ResultTab::Preview && self.markdown.contains("!["))
+        {
             self.request_original_texture(ui.ctx());
         }
-        let body_height = (ui.max_rect().bottom() - ui.cursor().top() - 132.0).max(150.0);
+        let body_height = (ui.max_rect().bottom() - ui.cursor().top() - 82.0).max(150.0);
         let (body_rect, _) =
             ui.allocate_exact_size(Vec2::new(content_width, body_height), Sense::hover());
         ui.painter()
@@ -1736,9 +1980,13 @@ impl MobileApp {
                                 }
                                 self.tts_scroll_to_current = false;
                             } else {
-                                let mut job = markdown_highlight_job(ui, &self.markdown);
-                                job.wrap.max_width = inner_width;
-                                ui.label(job);
+                                show_markdown_preview(
+                                    ui,
+                                    &self.markdown,
+                                    inner_width,
+                                    self.original_texture.as_ref(),
+                                    self.original_size,
+                                );
                             }
                         });
                 }
@@ -1806,41 +2054,43 @@ impl MobileApp {
             }
         }
 
-        ui.columns(2, |columns| {
+        ui.columns(4, |columns| {
             if columns[0]
                 .add_sized(
-                    [columns[0].available_width(), 44.0],
-                    egui::Button::new(rust_i18n::t!("mobile_save_docx").into_owned()),
+                    [columns[0].available_width(), 36.0],
+                    egui::Button::new("↓ DOCX"),
                 )
+                .on_hover_text(rust_i18n::t!("mobile_save_docx").into_owned())
                 .clicked()
             {
                 self.save_docx();
             }
             if columns[1]
                 .add_sized(
-                    [columns[1].available_width(), 44.0],
-                    egui::Button::new(rust_i18n::t!("mobile_save_markdown").into_owned()),
+                    [columns[1].available_width(), 36.0],
+                    egui::Button::new("↓ MD"),
                 )
+                .on_hover_text(rust_i18n::t!("mobile_save_markdown").into_owned())
                 .clicked()
             {
                 self.save_markdown();
             }
-        });
-        ui.columns(2, |columns| {
-            if columns[0]
+            if columns[2]
                 .add_sized(
-                    [columns[0].available_width(), 44.0],
-                    egui::Button::new(rust_i18n::t!("mobile_share_docx").into_owned()),
+                    [columns[2].available_width(), 36.0],
+                    egui::Button::new("↗ DOCX"),
                 )
+                .on_hover_text(rust_i18n::t!("mobile_share_docx").into_owned())
                 .clicked()
             {
                 self.share_docx();
             }
-            if columns[1]
+            if columns[3]
                 .add_sized(
-                    [columns[1].available_width(), 44.0],
-                    egui::Button::new(rust_i18n::t!("mobile_share_markdown").into_owned()),
+                    [columns[3].available_width(), 36.0],
+                    egui::Button::new("↗ MD"),
                 )
+                .on_hover_text(rust_i18n::t!("mobile_share_markdown").into_owned())
                 .clicked()
             {
                 self.share_markdown();
@@ -1899,10 +2149,55 @@ impl eframe::App for MobileApp {
 
 // -------------------------------------------------------------------- shared
 
+fn engine_picker(ui: &mut egui::Ui, selected: OcrEngine, label_key: &str) -> Option<OcrEngine> {
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new(rust_i18n::t!(label_key).into_owned())
+                .size(15.0)
+                .strong()
+                .color(INK),
+        );
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        let width = (ui.available_width() - 44.0) / 2.0;
+        for engine in [OcrEngine::PaddleV6, OcrEngine::PaddleVl16] {
+            if ui
+                .add_sized(
+                    [width, 42.0],
+                    egui::Button::new(engine.label()).selected(selected == engine),
+                )
+                .clicked()
+            {
+                choice = Some(engine);
+            }
+        }
+    });
+    choice
+}
+
 fn now_id() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * KIB;
+    const GIB: u64 = MIB * KIB;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{} KB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn swiped_primary_screen(screen: Screen, delta_x: f32, delta_y: f32) -> Screen {
@@ -1920,6 +2215,10 @@ fn should_auto_resume_download(entered: bool, active: bool, missing: bool, on_wi
     entered && !active && missing && on_wifi
 }
 
+fn accept_recognition_event(active: bool, current_generation: u64, event_generation: u64) -> bool {
+    active && current_generation == event_generation
+}
+
 fn history_card_open_response(ui: &mut egui::Ui, card: &egui::Response, id: u64) -> egui::Response {
     let mut rect = card.rect;
     rect.max.x = (rect.max.x - 64.0).max(rect.min.x);
@@ -1934,6 +2233,80 @@ fn markdown_highlight_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
         section.format.font_id = FontId::monospace(15.0);
     }
     job
+}
+
+fn markdown_image_path(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let image = line.strip_prefix("![")?;
+    let (_, path) = image.split_once("](")?;
+    path.strip_suffix(')')
+}
+
+fn ocr_image_crop(path: &str, original_size: [usize; 2]) -> Option<Rect> {
+    let (_, box_text) = path.split_once("image_box_")?;
+    let (box_text, _) = box_text.rsplit_once('.')?;
+    let coordinates = box_text
+        .split('_')
+        .map(str::parse::<usize>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let [left, top, right, bottom] = coordinates.as_slice() else {
+        return None;
+    };
+    if left >= right || top >= bottom || *right > original_size[0] || *bottom > original_size[1] {
+        return None;
+    }
+    Some(Rect::from_min_max(
+        egui::pos2(
+            *left as f32 / original_size[0] as f32,
+            *top as f32 / original_size[1] as f32,
+        ),
+        egui::pos2(
+            *right as f32 / original_size[0] as f32,
+            *bottom as f32 / original_size[1] as f32,
+        ),
+    ))
+}
+
+fn show_markdown_preview(
+    ui: &mut egui::Ui,
+    markdown: &str,
+    width: f32,
+    texture: Option<&egui::TextureHandle>,
+    original_size: Option<[usize; 2]>,
+) {
+    let mut source = String::new();
+    for line in markdown.lines() {
+        if let Some(path) = markdown_image_path(line) {
+            if !source.is_empty() {
+                let mut job = markdown_highlight_job(ui, &source);
+                job.wrap.max_width = width;
+                ui.label(job);
+                source.clear();
+            }
+            if let Some(texture) = texture {
+                let uv = original_size
+                    .and_then(|size| ocr_image_crop(path, size))
+                    .unwrap_or(Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                    ));
+                let pixels = texture.size_vec2() * uv.size();
+                let scale = (width / pixels.x).min(1.0);
+                ui.add(egui::Image::new((texture.id(), pixels * scale)).uv(uv));
+            } else {
+                ui.spinner();
+            }
+        } else {
+            source.push_str(line);
+            source.push('\n');
+        }
+    }
+    if !source.is_empty() {
+        let mut job = markdown_highlight_job(ui, &source);
+        job.wrap.max_width = width;
+        ui.label(job);
+    }
 }
 
 fn persist_picked_image(
@@ -2003,9 +2376,9 @@ fn top_bar(
 
 /// Icon + label laid out horizontally, centered in the given rect.
 fn paint_action(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, label: &str) {
-    let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(15.0), color);
-    let icon_size = 18.0;
-    let spacing = 8.0;
+    let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(13.0), color);
+    let icon_size = 16.0;
+    let spacing = 6.0;
     let total = icon_size + spacing + galley.size().x;
     let left = rect.center().x - total / 2.0;
     let icon_rect = Rect::from_min_size(
@@ -2017,7 +2390,7 @@ fn paint_action(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32,
         Pos2::new(left + icon_size + spacing, rect.center().y),
         Align2::LEFT_CENTER,
         label.to_owned(),
-        FontId::proportional(15.0),
+        FontId::proportional(13.0),
         color,
     );
 }
@@ -2243,23 +2616,6 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 stroke,
             );
         }
-        Icon::Pause => {
-            let width = (stroke.width * 1.8).max(2.0);
-            painter.line_segment(
-                [
-                    Pos2::new(center.x - s * 0.28, center.y - s * 0.6),
-                    Pos2::new(center.x - s * 0.28, center.y + s * 0.6),
-                ],
-                Stroke::new(width, color),
-            );
-            painter.line_segment(
-                [
-                    Pos2::new(center.x + s * 0.28, center.y - s * 0.6),
-                    Pos2::new(center.x + s * 0.28, center.y + s * 0.6),
-                ],
-                Stroke::new(width, color),
-            );
-        }
         Icon::Trash => {
             let body = Rect::from_min_max(
                 Pos2::new(center.x - s * 0.48, center.y - s * 0.25),
@@ -2369,6 +2725,32 @@ mod tests {
                 job.sections.iter().map(|part| part.format.color).collect();
             assert!(colors.len() > 1, "Markdown markup should be highlighted");
         });
+    }
+
+    #[test]
+    fn tiny_and_large_model_sizes_are_not_shown_as_zero_mb() {
+        assert_eq!(super::format_bytes(0), "0 B");
+        assert_eq!(super::format_bytes(1023), "1023 B");
+        assert_eq!(super::format_bytes(1024), "1 KB");
+        assert_eq!(super::format_bytes(65_536), "64 KB");
+        assert_eq!(super::format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(super::format_bytes(2_147_483_648), "2.0 GB");
+    }
+
+    #[test]
+    fn ocr_markdown_image_uses_the_matching_original_crop() {
+        let path = super::markdown_image_path("![Image](imgs/img_in_image_box_76_342_353_617.jpg)");
+        assert_eq!(path, Some("imgs/img_in_image_box_76_342_353_617.jpg"));
+        let crop = super::ocr_image_crop(path.unwrap(), [1000, 2000]).unwrap();
+        assert_eq!(crop.min, egui::pos2(0.076, 0.171));
+        assert_eq!(crop.max, egui::pos2(0.353, 0.3085));
+    }
+
+    #[test]
+    fn cancelled_ocr_results_cannot_overwrite_a_restarted_scan() {
+        assert!(!super::accept_recognition_event(true, 8, 7));
+        assert!(!super::accept_recognition_event(false, 8, 8));
+        assert!(super::accept_recognition_event(true, 8, 8));
     }
 
     #[test]

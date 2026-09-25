@@ -54,11 +54,29 @@ impl LocaleManager {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrEngine {
+    #[default]
+    PaddleV6,
+    PaddleVl16,
+}
+
+impl OcrEngine {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PaddleV6 => "PP-OCRv6 · ONNX",
+            Self::PaddleVl16 => "PaddleOCR-VL 1.6",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
     pub locale: LocaleSettings,
     pub download: DownloadSettings,
+    pub ocr_engine: OcrEngine,
 }
 
 impl Default for Settings {
@@ -66,6 +84,7 @@ impl Default for Settings {
         Self {
             locale: LocaleSettings::default(),
             download: DownloadSettings::default(),
+            ocr_engine: OcrEngine::default(),
         }
     }
 }
@@ -106,6 +125,7 @@ impl Default for LocaleSettings {
 #[serde(default)]
 pub struct DownloadSettings {
     pub resume: bool,
+    pub wifi_only: bool,
     pub hf_endpoint: String,
     pub github_proxy: String,
 }
@@ -114,6 +134,7 @@ impl Default for DownloadSettings {
     fn default() -> Self {
         Self {
             resume: true,
+            wifi_only: false,
             hf_endpoint: String::new(),
             github_proxy: String::new(),
         }
@@ -137,7 +158,10 @@ impl DownloadSettings {
                 .trim_end_matches('/');
             return source.replacen("https://huggingface.co", endpoint, 1);
         }
-        if source.starts_with("https://github.com/") && !self.github_proxy.trim().is_empty() {
+        if (source.starts_with("https://github.com/")
+            || source.starts_with("https://raw.githubusercontent.com/"))
+            && !self.github_proxy.trim().is_empty()
+        {
             for placeholder in ["${giturl}", "{$giturl}", "{giturl}"] {
                 if self.github_proxy.contains(placeholder) {
                     return self.github_proxy.replace(placeholder, source);
@@ -150,7 +174,7 @@ impl DownloadSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadSettings, LocaleManager, Settings};
+    use super::{DownloadSettings, LocaleManager, OcrEngine, Settings};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -209,6 +233,15 @@ mod tests {
                 format!("https://gh-proxy.com/{source}")
             );
         }
+        let raw = "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/v3.7.0/ppocr/utils/dict/ppocrv6_dict.txt";
+        let settings = DownloadSettings {
+            github_proxy: "https://gh-proxy.com/{giturl}".to_owned(),
+            ..DownloadSettings::default()
+        };
+        assert_eq!(
+            settings.resolve_url(raw, "zh-CN", None),
+            format!("https://gh-proxy.com/{raw}")
+        );
     }
 
     #[test]
@@ -236,16 +269,29 @@ mod tests {
         let mut settings = Settings::default();
         settings.locale.language = "ja".to_owned();
         settings.download.resume = false;
+        settings.download.wifi_only = true;
         settings.download.github_proxy = "https://gh-proxy.org/{giturl}".to_owned();
         settings.save(&path).unwrap();
 
         let loaded = Settings::load_or_default(&path);
         assert_eq!(loaded.locale.language, "ja");
         assert!(!loaded.download.resume);
+        assert!(loaded.download.wifi_only);
         assert_eq!(
             loaded.download.github_proxy,
             "https://gh-proxy.org/{giturl}"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ocr_engine_defaults_to_v6_and_survives_settings_round_trip() {
+        assert_eq!(Settings::default().ocr_engine, OcrEngine::PaddleV6);
+        let legacy: Settings = toml::from_str("[locale]\nlanguage = 'en'\n").unwrap();
+        assert_eq!(legacy.ocr_engine, OcrEngine::PaddleV6);
+        let mut selected = Settings::default();
+        selected.ocr_engine = OcrEngine::PaddleVl16;
+        let restored: Settings = toml::from_str(&toml::to_string(&selected).unwrap()).unwrap();
+        assert_eq!(restored.ocr_engine, OcrEngine::PaddleVl16);
     }
 }

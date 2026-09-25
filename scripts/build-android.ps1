@@ -110,7 +110,7 @@ try {
     foreach ($abiName in $Abi) {
         $source = Join-Path $repo "android\app\build\outputs\apk\release\app-$abiName-release.apk"
         if (-not (Test-Path -LiteralPath $source)) { throw "Missing APK: $source" }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $dist "bibiocr-mobile-v0.1.1-$abiName.apk") -Force
+        Copy-Item -LiteralPath $source -Destination (Join-Path $dist "bibiocr-mobile-v0.1.3-$abiName.apk") -Force
     }
     Get-ChildItem -LiteralPath $dist -Filter '*.apk' | Select-Object Name, Length
 } finally { Pop-Location }
