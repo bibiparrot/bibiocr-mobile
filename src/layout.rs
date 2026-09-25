@@ -215,7 +215,9 @@ mod tests {
     fn real_layout_model_returns_valid_blocks() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let blocks = super::analyze(
-            &root.join("downloads/inference.onnx"),
+            &root
+                .join("downloads")
+                .join(crate::core::MODELS[2].file_name),
             &root.join("docs/text.png"),
         )
         .unwrap();

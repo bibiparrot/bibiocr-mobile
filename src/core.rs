@@ -1,4 +1,4 @@
-use crate::settings::OcrEngine;
+use crate::settings::{OcrEngine, TtsEngine};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6,7 +6,8 @@ pub enum ModelGroup {
     Vl,
     V6,
     Layout,
-    Shared,
+    Melo,
+    Kokoro,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,7 +19,7 @@ pub struct ModelSpec {
     pub expected_bytes: u64,
 }
 
-pub const MODELS: [ModelSpec; 10] = [
+pub const MODELS: [ModelSpec; 13] = [
     ModelSpec {
         group: ModelGroup::Vl,
         name: "VLM",
@@ -36,26 +37,26 @@ pub const MODELS: [ModelSpec; 10] = [
     ModelSpec {
         group: ModelGroup::Layout,
         name: "Layout",
-        file_name: "inference.onnx",
+        file_name: "pp-doclayoutv3_onnx.onnx",
         url: "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3_onnx/resolve/main/inference.onnx",
         expected_bytes: 130_502_049,
     },
     ModelSpec {
-        group: ModelGroup::Shared,
+        group: ModelGroup::Melo,
         name: "Melo TTS (Chinese + English)",
         file_name: "melo-model.onnx",
         url: "https://huggingface.co/csukuangfj/vits-melo-tts-zh_en/resolve/a0d5c6a264c0ef92d70d8661d8cc502d79627cd6/model.onnx",
         expected_bytes: 170_429_550,
     },
     ModelSpec {
-        group: ModelGroup::Shared,
+        group: ModelGroup::Melo,
         name: "Melo TTS lexicon",
         file_name: "melo-lexicon.txt",
         url: "https://huggingface.co/csukuangfj/vits-melo-tts-zh_en/resolve/a0d5c6a264c0ef92d70d8661d8cc502d79627cd6/lexicon.txt",
         expected_bytes: 6_837_671,
     },
     ModelSpec {
-        group: ModelGroup::Shared,
+        group: ModelGroup::Melo,
         name: "Melo TTS tokens",
         file_name: "melo-tokens.txt",
         url: "https://huggingface.co/csukuangfj/vits-melo-tts-zh_en/resolve/a0d5c6a264c0ef92d70d8661d8cc502d79627cd6/tokens.txt",
@@ -89,14 +90,42 @@ pub const MODELS: [ModelSpec; 10] = [
         url: "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/v3.7.0/ppocr/utils/dict/ppocrv6_dict.txt",
         expected_bytes: 74_947,
     },
+    ModelSpec {
+        group: ModelGroup::Kokoro,
+        name: "Kokoro voice af_heart",
+        file_name: "af_heart.bin",
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_heart.bin",
+        expected_bytes: 522_240,
+    },
+    ModelSpec {
+        group: ModelGroup::Kokoro,
+        name: "Kokoro ONNX",
+        file_name: "kokoro-model.onnx",
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx",
+        expected_bytes: 325_532_232,
+    },
+    ModelSpec {
+        group: ModelGroup::Kokoro,
+        name: "Kokoro tokenizer",
+        file_name: "kokoro-tokenizer.json",
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/tokenizer.json",
+        expected_bytes: 3_497,
+    },
 ];
 
-pub fn required_models(engine: OcrEngine) -> impl Iterator<Item = (usize, &'static ModelSpec)> {
+pub fn required_models(
+    engine: OcrEngine,
+    tts_engine: TtsEngine,
+) -> impl Iterator<Item = (usize, &'static ModelSpec)> {
     MODELS.iter().enumerate().filter(move |(_, model)| {
-        matches!(model.group, ModelGroup::Shared | ModelGroup::Layout)
+        model.group == ModelGroup::Layout
             || matches!(
                 (engine, model.group),
                 (OcrEngine::PaddleV6, ModelGroup::V6) | (OcrEngine::PaddleVl16, ModelGroup::Vl)
+            )
+            || matches!(
+                (tts_engine, model.group),
+                (TtsEngine::Melo, ModelGroup::Melo) | (TtsEngine::Kokoro, ModelGroup::Kokoro)
             )
     })
 }
@@ -147,8 +176,8 @@ impl SystemInsetsPx {
     }
 }
 
-pub fn initial_screen(model_dir: &Path, engine: OcrEngine) -> Screen {
-    if required_models(engine).all(|(_, model)| {
+pub fn initial_screen(model_dir: &Path, engine: OcrEngine, tts_engine: TtsEngine) -> Screen {
+    if required_models(engine, tts_engine).all(|(_, model)| {
         model_dir
             .join(model.file_name)
             .metadata()
@@ -163,7 +192,7 @@ pub fn initial_screen(model_dir: &Path, engine: OcrEngine) -> Screen {
 #[cfg(test)]
 mod tests {
     use super::{MODELS, Screen, SystemInsetsPx, initial_screen};
-    use crate::settings::OcrEngine;
+    use crate::settings::{OcrEngine, TtsEngine};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -174,32 +203,50 @@ mod tests {
         for file_name in ["melo-model.onnx", "melo-lexicon.txt", "melo-tokens.txt"] {
             assert!(MODELS.iter().any(|model| model.file_name == file_name));
         }
-        assert!(!MODELS.iter().any(|model| model.name.starts_with("Kokoro")));
+        assert!(MODELS.iter().any(|model| model.name.starts_with("Kokoro")));
     }
 
     #[test]
     fn selected_ocr_engine_requires_only_its_models_and_shared_tts() {
-        let v6 = super::required_models(OcrEngine::PaddleV6)
+        let v6 = super::required_models(OcrEngine::PaddleV6, TtsEngine::Melo)
             .map(|(_, model)| model.file_name)
             .collect::<Vec<_>>();
         assert!(v6.contains(&"pp-ocrv6_small_det.onnx"));
         assert!(v6.contains(&"pp-ocrv6_small_rec.onnx"));
         assert!(v6.contains(&"ppocrv6_dict.txt"));
-        assert!(v6.contains(&"inference.onnx"));
+        assert!(v6.contains(&"pp-doclayoutv3_onnx.onnx"));
         assert!(!v6.contains(&"pp-doclayout_plus-l.onnx"));
         assert_eq!(
-            v6.iter().filter(|name| **name == "inference.onnx").count(),
+            v6.iter()
+                .filter(|name| **name == "pp-doclayoutv3_onnx.onnx")
+                .count(),
             1
         );
         assert!(v6.contains(&"melo-model.onnx"));
         assert!(!v6.iter().any(|name| name.ends_with(".gguf")));
 
-        let vl = super::required_models(OcrEngine::PaddleVl16)
+        let vl = super::required_models(OcrEngine::PaddleVl16, TtsEngine::Melo)
             .map(|(_, model)| model.file_name)
             .collect::<Vec<_>>();
         assert!(vl.contains(&"PaddleOCR-VL-1.6-GGUF.gguf"));
         assert!(vl.contains(&"melo-model.onnx"));
         assert!(!vl.contains(&"pp-ocrv6_small_det.onnx"));
+    }
+
+    #[test]
+    fn selected_tts_engine_requires_only_its_own_three_files() {
+        let melo = super::required_models(OcrEngine::PaddleV6, TtsEngine::Melo)
+            .map(|(_, model)| model.file_name)
+            .collect::<Vec<_>>();
+        assert!(melo.contains(&"melo-model.onnx"));
+        assert!(!melo.contains(&"kokoro-model.onnx"));
+        let kokoro = super::required_models(OcrEngine::PaddleV6, TtsEngine::Kokoro)
+            .map(|(_, model)| model.file_name)
+            .collect::<Vec<_>>();
+        for name in ["af_heart.bin", "kokoro-model.onnx", "kokoro-tokenizer.json"] {
+            assert!(kokoro.contains(&name));
+        }
+        assert!(!kokoro.contains(&"melo-model.onnx"));
     }
 
     #[test]
@@ -212,15 +259,18 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        for (_, model) in super::required_models(OcrEngine::PaddleV6) {
+        for (_, model) in super::required_models(OcrEngine::PaddleV6, TtsEngine::Melo) {
             fs::File::create(root.join(model.file_name))
                 .unwrap()
                 .set_len(model.expected_bytes)
                 .unwrap();
         }
-        assert_eq!(initial_screen(&root, OcrEngine::PaddleV6), Screen::History);
         assert_eq!(
-            initial_screen(&root, OcrEngine::PaddleVl16),
+            initial_screen(&root, OcrEngine::PaddleV6, TtsEngine::Melo),
+            Screen::History
+        );
+        assert_eq!(
+            initial_screen(&root, OcrEngine::PaddleVl16, TtsEngine::Melo),
             Screen::Download
         );
         fs::remove_dir_all(root).unwrap();
@@ -237,13 +287,19 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
 
-        assert_eq!(initial_screen(&root, OcrEngine::PaddleV6), Screen::Download);
+        assert_eq!(
+            initial_screen(&root, OcrEngine::PaddleV6, TtsEngine::Melo),
+            Screen::Download
+        );
 
         for model in MODELS {
             let file = fs::File::create(root.join(model.file_name)).unwrap();
             file.set_len(model.expected_bytes).unwrap();
         }
-        assert_eq!(initial_screen(&root, OcrEngine::PaddleV6), Screen::History);
+        assert_eq!(
+            initial_screen(&root, OcrEngine::PaddleV6, TtsEngine::Melo),
+            Screen::History
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -266,7 +322,10 @@ mod tests {
             .set_len(1)
             .unwrap();
 
-        assert_eq!(initial_screen(&root, OcrEngine::PaddleV6), Screen::Download);
+        assert_eq!(
+            initial_screen(&root, OcrEngine::PaddleV6, TtsEngine::Melo),
+            Screen::Download
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

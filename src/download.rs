@@ -1,5 +1,5 @@
 use crate::core::{self, ModelSpec};
-use crate::settings::{DownloadSettings, OcrEngine};
+use crate::settings::{DownloadSettings, OcrEngine, TtsEngine};
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -47,6 +47,7 @@ pub fn start(
     settings: DownloadSettings,
     locale: &'static str,
     engine: OcrEngine,
+    tts_engine: TtsEngine,
 ) -> DownloadTask {
     let (sender, events) = mpsc::channel();
     let paused = Arc::new(AtomicBool::new(false));
@@ -54,7 +55,7 @@ pub fn start(
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     thread::spawn(move || {
-        for (index, model) in core::required_models(engine) {
+        for (index, model) in core::required_models(engine, tts_engine) {
             if worker_cancelled.load(Ordering::Relaxed) {
                 return;
             }
@@ -98,7 +99,27 @@ pub fn installed(model_dir: &Path, model: &ModelSpec) -> bool {
 }
 
 pub fn cleanup_obsolete_layout(model_dir: &Path) {
+    let previous = model_dir.join("inference.onnx");
+    let current = model_dir.join(crate::core::MODELS[2].file_name);
+    let previous_partial = model_dir.join("inference.onnx.part");
+    let current_partial = model_dir.join("pp-doclayoutv3_onnx.onnx.part");
+    if !current_partial.exists() && !current.exists() && previous_partial.exists() {
+        let _ = fs::rename(previous_partial, current_partial);
+    }
+    if !current.exists()
+        && previous
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == crate::core::MODELS[2].expected_bytes)
+    {
+        let _ = fs::rename(&previous, &current);
+    }
     if installed(model_dir, &crate::core::MODELS[2]) {
+        if previous
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == crate::core::MODELS[2].expected_bytes)
+        {
+            let _ = fs::remove_file(previous);
+        }
         for name in ["pp-doclayout_plus-l.onnx", "pp-doclayout_plus-l.onnx.part"] {
             let _ = fs::remove_file(model_dir.join(name));
         }
@@ -240,7 +261,7 @@ fn resume_offset(partial: &Path, enabled: bool) -> u64 {
 mod tests {
     use super::{installed, resume_offset};
     use crate::core::{MODELS, ModelGroup, ModelSpec};
-    use crate::settings::OcrEngine;
+    use crate::settings::{OcrEngine, TtsEngine};
     use std::{
         fs,
         io::{Read, Write},
@@ -359,17 +380,24 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let required = crate::core::required_models(OcrEngine::PaddleV6).collect::<Vec<_>>();
+        let required =
+            crate::core::required_models(OcrEngine::PaddleV6, TtsEngine::Melo).collect::<Vec<_>>();
         for (_, model) in &required {
             fs::File::create(root.join(model.file_name))
                 .unwrap()
                 .set_len(model.expected_bytes)
                 .unwrap();
         }
-        let events = super::start(root.clone(), Default::default(), "en", OcrEngine::PaddleV6)
-            .events
-            .into_iter()
-            .collect::<Vec<_>>();
+        let events = super::start(
+            root.clone(),
+            Default::default(),
+            "en",
+            OcrEngine::PaddleV6,
+            TtsEngine::Melo,
+        )
+        .events
+        .into_iter()
+        .collect::<Vec<_>>();
         assert_eq!(
             events
                 .iter()
@@ -408,6 +436,46 @@ mod tests {
     }
 
     #[test]
+    fn previously_downloaded_v3_layout_is_renamed_without_downloading_again() {
+        let root = std::env::temp_dir().join(format!(
+            "bibiocr-layout-cache-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let previous = root.join("inference.onnx");
+        fs::File::create(&previous)
+            .unwrap()
+            .set_len(MODELS[2].expected_bytes)
+            .unwrap();
+        super::cleanup_obsolete_layout(&root);
+        assert!(super::installed(&root, &MODELS[2]));
+        assert!(!previous.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_v3_layout_download_keeps_its_resume_offset_after_rename() {
+        let root = std::env::temp_dir().join(format!(
+            "bibiocr-layout-partial-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let previous = root.join("inference.onnx.part");
+        fs::write(&previous, b"partially downloaded").unwrap();
+        super::cleanup_obsolete_layout(&root);
+        let current = root.join("pp-doclayoutv3_onnx.onnx.part");
+        assert_eq!(fs::read(current).unwrap(), b"partially downloaded");
+        assert!(!previous.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore = "downloads the real Melo model and lexicon once"]
     fn real_bilingual_tts_assets_download_and_reuse_cache() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("downloads");
@@ -416,6 +484,7 @@ mod tests {
             Default::default(),
             "zh-CN",
             OcrEngine::PaddleV6,
+            TtsEngine::Melo,
         );
         for event in task.events {
             match event {
@@ -430,7 +499,13 @@ mod tests {
             hf_endpoint: "http://127.0.0.1:9".to_owned(),
             ..Default::default()
         };
-        let cached = super::start(root, offline_settings, "zh-CN", OcrEngine::PaddleV6);
+        let cached = super::start(
+            root,
+            offline_settings,
+            "zh-CN",
+            OcrEngine::PaddleV6,
+            TtsEngine::Melo,
+        );
         for event in cached.events {
             match event {
                 super::DownloadEvent::Failed(_, error) => panic!("cache missed: {error}"),

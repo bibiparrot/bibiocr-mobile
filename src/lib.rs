@@ -8,6 +8,7 @@ pub mod core;
 pub mod download;
 pub mod export;
 pub mod history;
+mod kokoro_tts;
 pub mod layout;
 pub mod markdown;
 pub mod mobile;

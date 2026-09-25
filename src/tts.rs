@@ -1,3 +1,4 @@
+use crate::settings::TtsEngine;
 use sherpa_onnx::{
     GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsModelConfig,
     OfflineTtsVitsModelConfig,
@@ -130,6 +131,7 @@ pub fn synthesize_sentence(
     sentence: &str,
     model_dir: &Path,
     stop: &AtomicBool,
+    tts_engine: TtsEngine,
 ) -> Result<Arc<TtsAudio>, String> {
     let text = sentence.trim().replace('\0', "");
     if text.is_empty() {
@@ -138,12 +140,12 @@ pub fn synthesize_sentence(
     if stop.load(Ordering::Relaxed) {
         return Err("TTS stopped".to_owned());
     }
-    let key = text.clone();
+    let key = format!("{}:{text}", tts_engine.cache_name());
     let cache = AUDIO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(audio) = cache.lock().map_err(|error| error.to_string())?.get(&key) {
         return Ok(Arc::clone(audio));
     }
-    let result = generate_sentence(&text, model_dir, stop)?;
+    let result = generate_sentence(&text, model_dir, stop, tts_engine)?;
     cache
         .lock()
         .map_err(|error| error.to_string())?
@@ -155,6 +157,7 @@ fn generate_sentence(
     sentence: &str,
     model_dir: &Path,
     stop: &AtomicBool,
+    tts_engine: TtsEngine,
 ) -> Result<Arc<TtsAudio>, String> {
     let text = sentence.trim().replace('\0', "");
     if text.is_empty() {
@@ -162,6 +165,9 @@ fn generate_sentence(
     }
     if stop.load(Ordering::Relaxed) {
         return Err("TTS stopped".to_owned());
+    }
+    if tts_engine == TtsEngine::Kokoro {
+        return crate::kokoro_tts::synthesize(&text, model_dir);
     }
     let mut engine = ENGINE
         .get_or_init(|| Mutex::new(None))
@@ -215,8 +221,11 @@ pub fn synthesize_resilient(
     sentence: &str,
     model_dir: &Path,
     stop: &AtomicBool,
+    tts_engine: TtsEngine,
 ) -> Result<Vec<Arc<TtsAudio>>, String> {
-    synthesize_resilient_with(sentence, |part| synthesize_sentence(part, model_dir, stop))
+    synthesize_resilient_with(sentence, |part| {
+        synthesize_sentence(part, model_dir, stop, tts_engine)
+    })
 }
 
 pub fn synthesize_resilient_cached(
@@ -224,9 +233,10 @@ pub fn synthesize_resilient_cached(
     model_dir: &Path,
     document_dir: &Path,
     stop: &AtomicBool,
+    tts_engine: TtsEngine,
 ) -> Result<Vec<Arc<TtsAudio>>, String> {
     synthesize_resilient_cached_with(sentence, document_dir, |part| {
-        generate_sentence(part, model_dir, stop)
+        generate_sentence(part, model_dir, stop, tts_engine)
     })
 }
 
@@ -565,6 +575,7 @@ mod tests {
             "你好, hello world!",
             &model_dir,
             &std::sync::atomic::AtomicBool::new(false),
+            crate::settings::TtsEngine::Melo,
         )
         .unwrap();
         assert_eq!(audio.sample_rate, 44_100);
@@ -574,6 +585,7 @@ mod tests {
             "你好, hello world!",
             &model_dir,
             &std::sync::atomic::AtomicBool::new(false),
+            crate::settings::TtsEngine::Melo,
         )
         .unwrap();
         assert!(std::sync::Arc::ptr_eq(&audio, &reused));
@@ -581,6 +593,7 @@ mod tests {
             "13:37",
             &model_dir,
             &std::sync::atomic::AtomicBool::new(false),
+            crate::settings::TtsEngine::Melo,
         )
         .unwrap();
         assert!(clock.samples.len() > 4_410);

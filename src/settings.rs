@@ -71,12 +71,37 @@ impl OcrEngine {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsEngine {
+    #[default]
+    Melo,
+    Kokoro,
+}
+
+impl TtsEngine {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Melo => "Melo · ZH/EN",
+            Self::Kokoro => "Kokoro · EN",
+        }
+    }
+
+    pub const fn cache_name(self) -> &'static str {
+        match self {
+            Self::Melo => "melo",
+            Self::Kokoro => "kokoro",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
     pub locale: LocaleSettings,
     pub download: DownloadSettings,
     pub ocr_engine: OcrEngine,
+    pub tts_engine: TtsEngine,
 }
 
 impl Default for Settings {
@@ -85,6 +110,7 @@ impl Default for Settings {
             locale: LocaleSettings::default(),
             download: DownloadSettings::default(),
             ocr_engine: OcrEngine::default(),
+            tts_engine: TtsEngine::default(),
         }
     }
 }
@@ -174,7 +200,7 @@ impl DownloadSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadSettings, LocaleManager, OcrEngine, Settings};
+    use super::{DownloadSettings, LocaleManager, OcrEngine, Settings, TtsEngine};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -293,5 +319,19 @@ mod tests {
         selected.ocr_engine = OcrEngine::PaddleVl16;
         let restored: Settings = toml::from_str(&toml::to_string(&selected).unwrap()).unwrap();
         assert_eq!(restored.ocr_engine, OcrEngine::PaddleVl16);
+    }
+
+    #[test]
+    fn tts_engine_defaults_to_melo_and_survives_settings_round_trip() {
+        assert_eq!(Settings::default().tts_engine, TtsEngine::Melo);
+        let legacy: Settings = toml::from_str("ocr_engine = 'paddle_v6'").unwrap();
+        assert_eq!(legacy.tts_engine, TtsEngine::Melo);
+        let selected: Settings = toml::from_str("tts_engine = 'kokoro'").unwrap();
+        assert_eq!(selected.tts_engine, TtsEngine::Kokoro);
+        assert!(
+            toml::to_string(&selected)
+                .unwrap()
+                .contains("tts_engine = \"kokoro\"")
+        );
     }
 }

@@ -22,7 +22,7 @@ pub fn recognize_cancellable(
     let threads = std::thread::available_parallelism()
         .map_or(2, std::num::NonZero::get)
         .min(4);
-    let structure = OARStructureBuilder::new(model_dir.join("inference.onnx"))
+    let structure = OARStructureBuilder::new(model_dir.join(crate::core::MODELS[2].file_name))
         .ort_session(
             OrtSessionConfig::new()
                 .with_intra_threads(threads)
@@ -72,6 +72,7 @@ mod tests {
             Default::default(),
             "en",
             crate::settings::OcrEngine::PaddleV6,
+            crate::settings::TtsEngine::Melo,
         );
         for event in task.events {
             match event {

@@ -83,7 +83,13 @@ try {
         }
         rustup target add $target
         Assert-Success "Install Rust target $target"
-        cargo build --quiet --release --lib --target $target
+        # sherpa-onnx-sys copies shared libraries into target/release during its build script.
+        # On Windows, parallel Cargo jobs can hold those files open (os error 32).
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            cargo build --quiet --release --lib --target $target --jobs 1
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
+        }
         Assert-Success "Build Rust $abiName"
 
         $destination = Join-Path $repo "android\app\src\main\jniLibs\$abiName"
@@ -110,7 +116,7 @@ try {
     foreach ($abiName in $Abi) {
         $source = Join-Path $repo "android\app\build\outputs\apk\release\app-$abiName-release.apk"
         if (-not (Test-Path -LiteralPath $source)) { throw "Missing APK: $source" }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $dist "bibiocr-mobile-v0.1.3-$abiName.apk") -Force
+        Copy-Item -LiteralPath $source -Destination (Join-Path $dist "bibiocr-mobile-v0.1.4-$abiName.apk") -Force
     }
     Get-ChildItem -LiteralPath $dist -Filter '*.apk' | Select-Object Name, Length
 } finally { Pop-Location }

@@ -4,7 +4,7 @@ use crate::{
     core::{self, MODELS},
     download::{self, DownloadEvent, DownloadTask},
     history::{self, ScanRecord, ScanStage},
-    settings::{DownloadSettings, LocaleManager, OcrEngine, Settings},
+    settings::{DownloadSettings, LocaleManager, OcrEngine, Settings, TtsEngine},
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Margin, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -140,6 +140,8 @@ pub struct MobileApp {
     download_settings: DownloadSettings,
     ocr_engine: OcrEngine,
     download_view_engine: OcrEngine,
+    tts_engine: TtsEngine,
+    download_view_tts_engine: TtsEngine,
     locale: &'static str,
     language_choice: String,
     tts_active: bool,
@@ -184,7 +186,9 @@ impl MobileApp {
             configured_data.map_or_else(|| data_dir.join("downloads"), |path| path.join("models"));
         download::cleanup_obsolete_layout(&model_dir);
         let first_screen =
-            if core::initial_screen(&model_dir, settings.ocr_engine) == core::Screen::Download {
+            if core::initial_screen(&model_dir, settings.ocr_engine, settings.tts_engine)
+                == core::Screen::Download
+            {
                 Screen::Download
             } else {
                 Screen::History
@@ -211,6 +215,7 @@ impl MobileApp {
                 download_settings.clone(),
                 locale,
                 settings.ocr_engine,
+                settings.tts_engine,
             )
         });
         let history_path = data_dir.join("history.toml");
@@ -252,6 +257,8 @@ impl MobileApp {
             download_settings,
             ocr_engine: settings.ocr_engine,
             download_view_engine: settings.ocr_engine,
+            tts_engine: settings.tts_engine,
+            download_view_tts_engine: settings.tts_engine,
             locale,
             language_choice,
             tts_active: false,
@@ -551,8 +558,13 @@ impl MobileApp {
         self.recognition_progress = 0.1;
         self.recognition_text.clear();
         self.recognition_error = None;
-        let missing = core::required_models(engine)
-            .filter(|(_, model)| model.group != core::ModelGroup::Shared)
+        let missing = core::required_models(engine, self.tts_engine)
+            .filter(|(_, model)| {
+                !matches!(
+                    model.group,
+                    core::ModelGroup::Melo | core::ModelGroup::Kokoro
+                )
+            })
             .any(|(_, model)| !download::installed(&self.model_dir, model));
         if missing {
             self.recognition_active = false;
@@ -563,6 +575,7 @@ impl MobileApp {
                     self.download_settings.clone(),
                     self.locale,
                     engine,
+                    self.tts_engine,
                 ));
             }
             return;
@@ -735,15 +748,22 @@ impl MobileApp {
         let sender = self.app_sender.clone();
         let sentences = self.tts_sentences.clone();
         let model_dir = self.model_dir.clone();
+        let tts_engine = self.tts_engine;
         let document_dir = self.current_record_id.and_then(|id| {
             self.records
                 .iter()
                 .find(|record| record.id == id)
                 .map(|record| {
-                    self.data_dir
+                    let directory = self
+                        .data_dir
                         .join("tts")
                         .join(id.to_string())
-                        .join(record.tts_revision.to_string())
+                        .join(record.tts_revision.to_string());
+                    if tts_engine == TtsEngine::Melo {
+                        directory
+                    } else {
+                        directory.join(tts_engine.cache_name())
+                    }
                 })
         });
         std::thread::spawn(move || {
@@ -760,9 +780,10 @@ impl MobileApp {
                             &model_dir,
                             document_dir,
                             &stop,
+                            tts_engine,
                         )
                     } else {
-                        crate::tts::synthesize_resilient(sentence, &model_dir, &stop)
+                        crate::tts::synthesize_resilient(sentence, &model_dir, &stop, tts_engine)
                     };
                     let audio = match result {
                         Ok(audio) => audio,
@@ -808,7 +829,10 @@ impl MobileApp {
                     ))));
                 }
                 if generated == 0 && skipped > 0 {
-                    Err("Melo TTS could not read any segment".to_owned())
+                    Err(format!(
+                        "{} TTS could not read any segment",
+                        tts_engine.cache_name()
+                    ))
                 } else {
                     Ok(())
                 }
@@ -823,11 +847,21 @@ impl MobileApp {
         if self.tts_active {
             return;
         }
-        if !MODELS[3..6]
+        if !MODELS
             .iter()
+            .filter(|model| {
+                matches!(
+                    (self.tts_engine, model.group),
+                    (TtsEngine::Melo, core::ModelGroup::Melo)
+                        | (TtsEngine::Kokoro, core::ModelGroup::Kokoro)
+                )
+            })
             .all(|model| download::installed(&self.model_dir, model))
         {
-            self.notice = Some("Download the Melo Chinese-English TTS files first".to_owned());
+            self.notice = Some(format!(
+                "Download the {} TTS files first",
+                self.tts_engine.cache_name()
+            ));
             return;
         }
         let Some(index) = self
@@ -981,9 +1015,18 @@ impl MobileApp {
         self.poll_downloads();
         if entered {
             self.download_view_engine = self.ocr_engine;
+            self.download_view_tts_engine = self.tts_engine;
         }
-        let required = core::required_models(self.download_view_engine).collect::<Vec<_>>();
-        let missing = core::required_models(self.ocr_engine)
+        let mut required =
+            core::required_models(self.download_view_engine, self.download_view_tts_engine)
+                .collect::<Vec<_>>();
+        required.sort_by_key(|(_, model)| {
+            matches!(
+                model.group,
+                core::ModelGroup::Melo | core::ModelGroup::Kokoro
+            )
+        });
+        let missing = core::required_models(self.ocr_engine, self.tts_engine)
             .map(|(_, model)| model)
             .any(|model| !download::installed(&self.model_dir, model));
         let check_wifi = entered && self.download_task.is_none() && missing;
@@ -1002,6 +1045,7 @@ impl MobileApp {
                 self.download_settings.clone(),
                 self.locale,
                 self.ocr_engine,
+                self.tts_engine,
             ));
         }
         let title = rust_i18n::t!("mobile_download_title").into_owned();
@@ -1020,6 +1064,7 @@ impl MobileApp {
             return;
         }
         let content_height = (ui.available_height() - 74.0).max(0.0);
+        let mut next_tts_view = None;
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), content_height),
             egui::Layout::top_down(egui::Align::Min),
@@ -1125,10 +1170,22 @@ impl MobileApp {
                             self.download_settings.clone(),
                             self.locale,
                             self.ocr_engine,
+                            self.tts_engine,
                         ));
                     }
 
+                    let mut showing_tts = false;
                     for &(index, model) in &required {
+                        if !showing_tts
+                            && matches!(
+                                model.group,
+                                core::ModelGroup::Melo | core::ModelGroup::Kokoro
+                            )
+                        {
+                            showing_tts = true;
+                            next_tts_view = tts_picker(ui, self.download_view_tts_engine);
+                            ui.add_space(8.0);
+                        }
                         let (downloaded, total) = self.model_progress[index];
                         let fraction = if total == 0 {
                             0.0
@@ -1218,6 +1275,10 @@ impl MobileApp {
                 });
             },
         );
+        if let Some(engine) = next_tts_view {
+            self.download_view_tts_engine = engine;
+            ui.ctx().request_repaint();
+        }
 
         let panel = ui.clip_rect();
         let bar = Rect::from_min_max(
@@ -1307,7 +1368,7 @@ impl MobileApp {
         if let Some(task) = self.download_task.take() {
             task.cancel();
         }
-        if core::required_models(self.ocr_engine)
+        if core::required_models(self.ocr_engine, self.tts_engine)
             .any(|(_, model)| !download::installed(&self.model_dir, model))
         {
             self.download_task = Some(download::start(
@@ -1315,6 +1376,7 @@ impl MobileApp {
                 self.download_settings.clone(),
                 self.locale,
                 self.ocr_engine,
+                self.tts_engine,
             ));
         }
     }
@@ -1348,16 +1410,50 @@ impl MobileApp {
                 model.expected_bytes,
             );
         }
-        if core::initial_screen(&self.model_dir, engine) == core::Screen::Download {
+        if core::initial_screen(&self.model_dir, engine, self.tts_engine) == core::Screen::Download
+        {
             self.screen = Screen::Download;
             self.download_task = Some(download::start(
                 self.model_dir.clone(),
                 self.download_settings.clone(),
                 self.locale,
                 engine,
+                self.tts_engine,
             ));
         } else if self.screen == Screen::Download {
             self.screen = Screen::History;
+        }
+    }
+
+    fn set_tts_engine(&mut self, engine: TtsEngine) {
+        if self.tts_engine == engine {
+            return;
+        }
+        let path = self.data_dir.join("settings.toml");
+        let mut settings = Settings::load_or_default(&path);
+        settings.tts_engine = engine;
+        if let Err(error) = settings.save(&path) {
+            self.notice = Some(error);
+            return;
+        }
+        if let Some(task) = self.download_task.take() {
+            task.cancel();
+        }
+        self.tts_stop.store(true, Ordering::Relaxed);
+        self.tts_active = false;
+        self.tts_engine = engine;
+        self.download_view_tts_engine = engine;
+        self.download_error = None;
+        if core::initial_screen(&self.model_dir, self.ocr_engine, engine) == core::Screen::Download
+        {
+            self.screen = Screen::Download;
+            self.download_task = Some(download::start(
+                self.model_dir.clone(),
+                self.download_settings.clone(),
+                self.locale,
+                self.ocr_engine,
+                engine,
+            ));
         }
     }
 
@@ -1377,6 +1473,12 @@ impl MobileApp {
         ui.add_space(12.0);
         if let Some(engine) = engine_picker(ui, self.ocr_engine, "mobile_ocr_engine") {
             self.set_ocr_engine(engine);
+            ui.ctx().request_repaint();
+            return;
+        }
+        ui.add_space(12.0);
+        if let Some(engine) = tts_picker(ui, self.tts_engine) {
+            self.set_tts_engine(engine);
             ui.ctx().request_repaint();
             return;
         }
@@ -2165,6 +2267,31 @@ fn engine_picker(ui: &mut egui::Ui, selected: OcrEngine, label_key: &str) -> Opt
         ui.add_space(16.0);
         let width = (ui.available_width() - 44.0) / 2.0;
         for engine in [OcrEngine::PaddleV6, OcrEngine::PaddleVl16] {
+            if ui
+                .add_sized(
+                    [width, 42.0],
+                    egui::Button::new(engine.label()).selected(selected == engine),
+                )
+                .clicked()
+            {
+                choice = Some(engine);
+            }
+        }
+    });
+    choice
+}
+
+fn tts_picker(ui: &mut egui::Ui, selected: TtsEngine) -> Option<TtsEngine> {
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("TTS").size(15.0).strong().color(INK));
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        let width = (ui.available_width() - 44.0) / 2.0;
+        for engine in [TtsEngine::Melo, TtsEngine::Kokoro] {
             if ui
                 .add_sized(
                     [width, 42.0],
