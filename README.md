@@ -34,8 +34,11 @@ Android Studio JBR, CMake 4.4.3, and Ninja. Override its path parameters on
 other machines. It downloads the sherpa-onnx Android runtime archive once and
 checks its SHA-256. Four APKs are written to `dist/`. This initial beta uses
 the local Android debug signing key so it can update existing installations
-without clearing models or history. Keep that key for future updates; do not
-upload it. The ignored real-model tests can be run when model files are cached.
+without clearing models or history. The GitHub Actions copy of this key is
+stored only in the encrypted `ANDROID_DEBUG_KEYSTORE_B64` repository secret;
+never commit or publicly upload the key. Pushing `main` builds and tests one
+APK per ABI. Pushing a `v*` tag publishes all four as a prerelease after the
+builds pass. The ignored real-model tests can be run when model files are cached.
 
 ## Settings and mirrors
 

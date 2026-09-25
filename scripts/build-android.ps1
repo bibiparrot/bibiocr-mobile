@@ -20,7 +20,7 @@ function Assert-Success([string]$step) {
     if ($LASTEXITCODE -ne 0) { throw "$step failed (exit $LASTEXITCODE)" }
 }
 
-foreach ($path in @($SdkRoot, $Ndk30, $Ndk26, $JdkRoot, $CmakeBin, $NinjaBin)) {
+foreach ($path in @($SdkRoot, $JdkRoot, $CmakeBin, $NinjaBin)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Build prerequisite missing: $path" }
 }
 
@@ -59,6 +59,7 @@ try {
         $config = $targets[$abiName]
         $target = $config.Rust
         $ndk = $config.Ndk
+        if (-not (Test-Path -LiteralPath $ndk)) { throw "Build prerequisite missing: $ndk" }
         $toolBin = Join-Path $ndk 'toolchains\llvm\prebuilt\windows-x86_64\bin'
         $cc = Join-Path $toolBin "$($config.Clang)27-clang.cmd"
         $cxx = Join-Path $toolBin "$($config.Clang)27-clang++.cmd"

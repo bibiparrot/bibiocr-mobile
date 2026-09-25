@@ -317,136 +317,152 @@ pub fn play_pcm(
         return Err("Invalid TTS sample rate".to_owned());
     }
     robius_android_env::with_activity(|env, _| {
-        let min_buffer = env
-            .call_static_method(
-                "android/media/AudioTrack",
-                "getMinBufferSize",
-                "(III)I",
-                &[
-                    JValueGen::Int(sample_rate),
-                    JValueGen::Int(4),
-                    JValueGen::Int(2),
-                ],
-            )
-            .and_then(|value| value.i())
-            .map_err(|error| error.to_string())?;
-        if min_buffer <= 0 {
-            return Err(format!("AudioTrack buffer error: {min_buffer}"));
-        }
-        let track = env
-            .new_object(
-                "android/media/AudioTrack",
-                "(IIIIII)V",
-                &[
-                    JValueGen::Int(3),
-                    JValueGen::Int(sample_rate),
-                    JValueGen::Int(4),
-                    JValueGen::Int(2),
-                    JValueGen::Int(min_buffer.max(4096)),
-                    JValueGen::Int(1),
-                ],
-            )
-            .map_err(|error| error.to_string())?;
         let result = (|| {
-            let params = env
-                .new_object("android/media/PlaybackParams", "()V", &[])
+            let min_buffer = env
+                .call_static_method(
+                    "android/media/AudioTrack",
+                    "getMinBufferSize",
+                    "(III)I",
+                    &[
+                        JValueGen::Int(sample_rate),
+                        JValueGen::Int(4),
+                        JValueGen::Int(2),
+                    ],
+                )
+                .and_then(|value| value.i())
                 .map_err(|error| error.to_string())?;
-            env.call_method(
-                &params,
-                "setPitch",
-                "(F)Landroid/media/PlaybackParams;",
-                &[JValueGen::Float(1.0)],
-            )
-            .map_err(|error| error.to_string())?;
-            let mut applied_speed = 0;
-            let mut update_speed = |env: &mut JNIEnv<'_>| -> Result<(), String> {
-                let requested = speed.load(Ordering::Relaxed);
-                if requested == applied_speed {
-                    return Ok(());
-                }
-                let rate = f32::from_bits(requested);
-                if ![0.5, 0.75, 1.0, 1.25, 1.5, 2.0].contains(&rate) {
-                    return Err("Unsupported playback speed".to_owned());
-                }
+            if min_buffer <= 0 {
+                return Err(format!("AudioTrack buffer error: {min_buffer}"));
+            }
+            let track = env
+                .new_object(
+                    "android/media/AudioTrack",
+                    "(IIIIII)V",
+                    &[
+                        JValueGen::Int(3),
+                        JValueGen::Int(sample_rate),
+                        JValueGen::Int(4),
+                        JValueGen::Int(2),
+                        JValueGen::Int(crate::tts::audio_track_buffer_bytes(min_buffer)),
+                        JValueGen::Int(1),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            let result = (|| {
+                let params = env
+                    .new_object("android/media/PlaybackParams", "()V", &[])
+                    .map_err(|error| error.to_string())?;
                 env.call_method(
                     &params,
-                    "setSpeed",
+                    "setPitch",
                     "(F)Landroid/media/PlaybackParams;",
-                    &[JValueGen::Float(rate)],
+                    &[JValueGen::Float(1.0)],
                 )
                 .map_err(|error| error.to_string())?;
-                env.call_method(
-                    &track,
-                    "setPlaybackParams",
-                    "(Landroid/media/PlaybackParams;)V",
-                    &[JValueGen::Object(&params)],
-                )
-                .map_err(|error| error.to_string())?;
-                applied_speed = requested;
-                Ok(())
-            };
-            env.call_method(&track, "play", "()V", &[])
-                .map_err(|error| error.to_string())?;
-            for chunk in samples.chunks(2048) {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                update_speed(env)?;
-                let level = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
-                env.call_method(&track, "setVolume", "(F)I", &[JValueGen::Float(level)])
+                let mut applied_speed = 0;
+                let mut update_speed = |env: &mut JNIEnv<'_>| -> Result<(), String> {
+                    let requested = speed.load(Ordering::Relaxed);
+                    if requested == applied_speed {
+                        return Ok(());
+                    }
+                    let rate = f32::from_bits(requested);
+                    if ![0.5, 0.75, 1.0, 1.25, 1.5, 2.0].contains(&rate) {
+                        return Err("Unsupported playback speed".to_owned());
+                    }
+                    env.call_method(
+                        &params,
+                        "setSpeed",
+                        "(F)Landroid/media/PlaybackParams;",
+                        &[JValueGen::Float(rate)],
+                    )
                     .map_err(|error| error.to_string())?;
-                let array = env
-                    .new_short_array(chunk.len() as i32)
+                    env.call_method(
+                        &track,
+                        "setPlaybackParams",
+                        "(Landroid/media/PlaybackParams;)V",
+                        &[JValueGen::Object(&params)],
+                    )
                     .map_err(|error| error.to_string())?;
-                env.set_short_array_region(&array, 0, chunk)
+                    applied_speed = requested;
+                    Ok(())
+                };
+                env.call_method(&track, "play", "()V", &[])
                     .map_err(|error| error.to_string())?;
-                let mut offset = 0;
-                while offset < chunk.len() {
+                for chunk in samples.chunks(2048) {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let written = env
-                        .call_method(
-                            &track,
-                            "write",
-                            "([SII)I",
-                            &[
-                                JValueGen::Object(array.as_ref()),
-                                JValueGen::Int(offset as i32),
-                                JValueGen::Int((chunk.len() - offset) as i32),
-                            ],
-                        )
-                        .and_then(|value| value.i())
+                    update_speed(env)?;
+                    let level = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
+                    env.call_method(&track, "setVolume", "(F)I", &[JValueGen::Float(level)])
                         .map_err(|error| error.to_string())?;
-                    if written <= 0 {
-                        return Err(format!("AudioTrack write failed: {written}"));
+                    let array = env
+                        .new_short_array(chunk.len() as i32)
+                        .map_err(|error| error.to_string())?;
+                    env.set_short_array_region(&array, 0, chunk)
+                        .map_err(|error| error.to_string())?;
+                    let mut offset = 0;
+                    while offset < chunk.len() {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let written = env
+                            .call_method(
+                                &track,
+                                "write",
+                                "([SII)I",
+                                &[
+                                    JValueGen::Object(array.as_ref()),
+                                    JValueGen::Int(offset as i32),
+                                    JValueGen::Int((chunk.len() - offset) as i32),
+                                ],
+                            )
+                            .and_then(|value| value.i())
+                            .map_err(|error| error.to_string())?;
+                        if written <= 0 {
+                            return Err(format!("AudioTrack write failed: {written}"));
+                        }
+                        offset += written as usize;
                     }
-                    offset += written as usize;
+                    env.delete_local_ref(array)
+                        .map_err(|error| error.to_string())?;
                 }
-                env.delete_local_ref(array)
-                    .map_err(|error| error.to_string())?;
+                // AudioTrack.write only queues PCM; stop() would discard its unplayed tail.
+                let deadline = Instant::now()
+                    + Duration::from_secs_f64(
+                        samples.len() as f64 / sample_rate as f64 / 0.5 + 5.0,
+                    );
+                while !stop.load(Ordering::Relaxed) {
+                    update_speed(env)?;
+                    let played =
+                        env.call_method(&track, "getPlaybackHeadPosition", "()I", &[])
+                            .and_then(|value| value.i())
+                            .map_err(|error| error.to_string())? as u32;
+                    if played as usize >= samples.len() {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("AudioTrack did not finish playback".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            })();
+            // JNI leaves a pending Java exception after a rejected playback speed.
+            // Clear it before calling stop/release or detaching this Rust thread.
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
             }
-            // AudioTrack.write only queues PCM; stop() would discard its unplayed tail.
-            let deadline = Instant::now()
-                + Duration::from_secs_f64(samples.len() as f64 / sample_rate as f64 / 0.5 + 5.0);
-            while !stop.load(Ordering::Relaxed) {
-                update_speed(env)?;
-                let played = env
-                    .call_method(&track, "getPlaybackHeadPosition", "()I", &[])
-                    .and_then(|value| value.i())
-                    .map_err(|error| error.to_string())? as u32;
-                if played as usize >= samples.len() {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    return Err("AudioTrack did not finish playback".to_owned());
-                }
-                std::thread::sleep(Duration::from_millis(20));
+            let _ = env.call_method(&track, "stop", "()V", &[]);
+            let _ = env.call_method(&track, "release", "()V", &[]);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
             }
-            Ok(())
+            result
         })();
-        let _ = env.call_method(&track, "stop", "()V", &[]);
-        let _ = env.call_method(&track, "release", "()V", &[]);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
         result
     })
     .map_err(|error| error.to_string())?

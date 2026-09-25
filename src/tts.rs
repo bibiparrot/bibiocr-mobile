@@ -20,6 +20,10 @@ pub struct TtsAudio {
     pub sample_rate: i32,
 }
 
+pub(crate) fn audio_track_buffer_bytes(min_buffer: i32) -> i32 {
+    min_buffer.saturating_mul(4).max(4096)
+}
+
 pub fn synthesize_sentence(
     sentence: &str,
     model_dir: &Path,
@@ -263,6 +267,11 @@ pub fn markdown_text(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audio_buffer_has_headroom_for_twice_speed() {
+        assert!(super::audio_track_buffer_bytes(4096) > 2 * 4096);
+    }
+
     #[test]
     fn failed_slice_does_not_silence_readable_parts() {
         let mut attempted = Vec::new();

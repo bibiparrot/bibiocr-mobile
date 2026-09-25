@@ -1,0 +1,132 @@
+name: Android APKs
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Rust core
+        shell: pwsh
+        run: |
+          cargo test --lib
+          if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed' }
+
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            ndk: '30.0.16248370'
+          - abi: armeabi-v7a
+            ndk: '30.0.16248370'
+          - abi: x86
+            ndk: '26.1.10909125'
+          - abi: x86_64
+            ndk: '26.1.10909125'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install pinned Android NDK
+        shell: pwsh
+        run: |
+          $manager = Join-Path $env:ANDROID_HOME 'cmdline-tools\latest\bin\sdkmanager.bat'
+          & $manager --install 'ndk;${{ matrix.ndk }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Android NDK installation failed' }
+
+      - name: Restore update-compatible signing key
+        shell: pwsh
+        env:
+          ANDROID_DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if (-not $env:ANDROID_DEBUG_KEYSTORE_B64) { throw 'Missing ANDROID_DEBUG_KEYSTORE_B64 secret' }
+          $keyPath = Join-Path $env:USERPROFILE '.android\debug.keystore'
+          New-Item -ItemType Directory -Force -Path (Split-Path $keyPath) | Out-Null
+          [IO.File]::WriteAllBytes($keyPath, [Convert]::FromBase64String($env:ANDROID_DEBUG_KEYSTORE_B64))
+          $fingerprint = ((& keytool -list -v -keystore $keyPath -storepass android -alias androiddebugkey |
+            Select-String 'SHA256:' | Select-Object -First 1).ToString() -split 'SHA256:')[-1].Trim().Replace(':', '').ToLowerInvariant()
+          if ($fingerprint -ne '4ca9f4bbcc644087234912bd967be9b2b68f5d8cd7cf1d77fb1b26a01a47d473') {
+            throw 'Signing key does not match existing Android installation'
+          }
+
+      - name: Build signed APK
+        shell: pwsh
+        run: |
+          $cmakeBin = Split-Path (Get-Command cmake.exe).Source
+          $ninjaBin = Split-Path (Get-Command ninja.exe).Source
+          & ./scripts/build-android.ps1 `
+            -Abi '${{ matrix.abi }}' `
+            -SdkRoot $env:ANDROID_HOME `
+            -Ndk30 (Join-Path $env:ANDROID_HOME 'ndk\30.0.16248370') `
+            -Ndk26 (Join-Path $env:ANDROID_HOME 'ndk\26.1.10909125') `
+            -JdkRoot $env:JAVA_HOME `
+            -CmakeBin $cmakeBin `
+            -NinjaBin $ninjaBin
+          if ($LASTEXITCODE -ne 0) { throw 'Android build failed' }
+
+      - name: Verify ABI splits and signatures
+        shell: pwsh
+        run: |
+          $aapt = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\aapt.exe'
+          $signer = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\apksigner.bat'
+          $abi = '${{ matrix.abi }}'
+          $apk = Join-Path 'dist' "bibiocr-mobile-v0.1.0-$abi.apk"
+          if (-not (Test-Path $apk)) { throw "Missing $apk" }
+          $badging = & $aapt dump badging $apk
+          if ($LASTEXITCODE -ne 0 -or -not ($badging -contains "native-code: '$abi'")) {
+            throw "Incorrect native ABI in $apk"
+          }
+          $certificate = & $signer verify --print-certs $apk
+          if ($LASTEXITCODE -ne 0 -or -not ($certificate -contains 'Signer #1 certificate SHA-256 digest: 4ca9f4bbcc644087234912bd967be9b2b68f5d8cd7cf1d77fb1b26a01a47d473')) {
+            throw "Incorrect signature in $apk"
+          }
+          $hash = (Get-FileHash $apk -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$abi $hash" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bibiocr-apk-${{ matrix.abi }}
+          path: dist/bibiocr-mobile-v0.1.0-${{ matrix.abi }}.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bibiocr-apk-*
+          path: dist
+          merge-multiple: true
+      - name: Publish tagged prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $apks = @(Get-ChildItem dist -Filter '*.apk' | ForEach-Object FullName)
+          if ($apks.Count -ne 4) { throw "Expected 4 APKs, found $($apks.Count)" }
+          gh release create $env:GITHUB_REF_NAME @apks --verify-tag --prerelease --title $env:GITHUB_REF_NAME --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publishing failed' }
