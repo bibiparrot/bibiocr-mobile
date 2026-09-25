@@ -128,6 +128,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $apks = @(Get-ChildItem dist -Filter '*.apk' | ForEach-Object FullName)
           if ($apks.Count -ne 4) { throw "Expected 4 APKs, found $($apks.Count)" }
