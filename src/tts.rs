@@ -4,7 +4,8 @@ use sherpa_onnx::{
 };
 use std::{
     collections::HashMap,
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -14,10 +15,92 @@ use std::{
 static ENGINE: OnceLock<Mutex<Option<OfflineTts>>> = OnceLock::new();
 // ponytail: Session-only cache; use disk/LRU if long documents cause memory pressure.
 static AUDIO_CACHE: OnceLock<Mutex<HashMap<String, Arc<TtsAudio>>>> = OnceLock::new();
+// ponytail: One speaker at a time; use per-document locks only if parallel TTS is needed.
+static PERSISTENT_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct TtsAudio {
     pub samples: Vec<i16>,
     pub sample_rate: i32,
+}
+
+fn cache_path(document_dir: &Path, text: &str) -> PathBuf {
+    let hash = text
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    document_dir.join(format!("{hash:016x}.pcm"))
+}
+
+fn load_cached_audio(path: &Path, text: &str) -> Option<Arc<TtsAudio>> {
+    if fs::metadata(path).ok()?.len() > 100 * 1024 * 1024 {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 20 || &bytes[..8] != b"BIBITTS1" {
+        return None;
+    }
+    let sample_rate = i32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let text_len = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let sample_count = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
+    let pcm_start = 20usize.checked_add(text_len)?;
+    let expected = pcm_start.checked_add(sample_count.checked_mul(2)?)?;
+    if sample_rate <= 0
+        || sample_count == 0
+        || expected != bytes.len()
+        || bytes.get(20..pcm_start)? != text.as_bytes()
+    {
+        return None;
+    }
+    let samples = bytes[pcm_start..]
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Some(Arc::new(TtsAudio {
+        samples,
+        sample_rate,
+    }))
+}
+
+fn save_cached_audio(path: &Path, text: &str, audio: &TtsAudio) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let text_len = u32::try_from(text.len()).map_err(|error| error.to_string())?;
+    let sample_count = u32::try_from(audio.samples.len()).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(20 + text.len() + audio.samples.len() * 2);
+    bytes.extend_from_slice(b"BIBITTS1");
+    bytes.extend_from_slice(&audio.sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&text_len.to_le_bytes());
+    bytes.extend_from_slice(&sample_count.to_le_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+    for sample in &audio.samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(temp, path).map_err(|error| error.to_string())
+}
+
+fn cached_audio(
+    document_dir: &Path,
+    text: &str,
+    generate: impl FnOnce() -> Result<Arc<TtsAudio>, String>,
+) -> Result<Arc<TtsAudio>, String> {
+    let _guard = PERSISTENT_CACHE_LOCK
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let path = cache_path(document_dir, text);
+    if let Some(audio) = load_cached_audio(&path, text) {
+        return Ok(audio);
+    }
+    let audio = generate()?;
+    save_cached_audio(&path, text, &audio)?;
+    Ok(audio)
 }
 
 pub(crate) fn stretch_pcm_chunk(
@@ -59,6 +142,26 @@ pub fn synthesize_sentence(
     let cache = AUDIO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(audio) = cache.lock().map_err(|error| error.to_string())?.get(&key) {
         return Ok(Arc::clone(audio));
+    }
+    let result = generate_sentence(&text, model_dir, stop)?;
+    cache
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(key, Arc::clone(&result));
+    Ok(result)
+}
+
+fn generate_sentence(
+    sentence: &str,
+    model_dir: &Path,
+    stop: &AtomicBool,
+) -> Result<Arc<TtsAudio>, String> {
+    let text = sentence.trim().replace('\0', "");
+    if text.is_empty() {
+        return Err("There is no text to read".to_owned());
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Err("TTS stopped".to_owned());
     }
     let mut engine = ENGINE
         .get_or_init(|| Mutex::new(None))
@@ -105,10 +208,6 @@ pub fn synthesize_sentence(
         samples: pcm,
         sample_rate: engine.sample_rate(),
     });
-    cache
-        .lock()
-        .map_err(|error| error.to_string())?
-        .insert(key, Arc::clone(&result));
     Ok(result)
 }
 
@@ -118,6 +217,19 @@ pub fn synthesize_resilient(
     stop: &AtomicBool,
 ) -> Result<Vec<Arc<TtsAudio>>, String> {
     synthesize_resilient_with(sentence, |part| synthesize_sentence(part, model_dir, stop))
+}
+
+pub fn synthesize_resilient_cached(
+    sentence: &str,
+    model_dir: &Path,
+    document_dir: &Path,
+    stop: &AtomicBool,
+) -> Result<Vec<Arc<TtsAudio>>, String> {
+    synthesize_resilient_with(sentence, |part| {
+        cached_audio(document_dir, part, || {
+            generate_sentence(part, model_dir, stop)
+        })
+    })
 }
 
 fn synthesize_resilient_with<T>(
@@ -286,6 +398,52 @@ pub fn markdown_text(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn document_audio_is_reused_until_regenerated() {
+        let root = std::env::temp_dir().join(format!(
+            "bibiocr-tts-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let document = root.join("7").join("0");
+        let original = super::cached_audio(&document, "你好。", || {
+            Ok(std::sync::Arc::new(super::TtsAudio {
+                samples: vec![1, 2, 3],
+                sample_rate: 44_100,
+            }))
+        })
+        .unwrap();
+        drop(original);
+        let reused = super::cached_audio(&document, "你好。", || {
+            panic!("cached audio must not be generated again")
+        })
+        .unwrap();
+        assert_eq!(reused.samples, [1, 2, 3]);
+        let next_revision = root.join("7").join("1");
+        let regenerated = super::cached_audio(&next_revision, "你好。", || {
+            Ok(std::sync::Arc::new(super::TtsAudio {
+                samples: vec![4, 5],
+                sample_rate: 44_100,
+            }))
+        })
+        .unwrap();
+        assert_eq!(regenerated.samples, [4, 5]);
+        assert_eq!(
+            super::cached_audio(&document, "你好。", || panic!("old cache deleted"))
+                .unwrap()
+                .samples,
+            [1, 2, 3]
+        );
+        std::fs::remove_file(super::cache_path(&document, "你好。")).unwrap();
+        std::fs::remove_file(super::cache_path(&next_revision, "你好。")).unwrap();
+        std::fs::remove_dir(next_revision).unwrap();
+        std::fs::remove_dir(document).unwrap();
+        std::fs::remove_dir(root.join("7")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn wsola_changes_tempo_mid_stream_without_changing_sample_rate() {
         let input: Vec<i16> = (0..44_100)

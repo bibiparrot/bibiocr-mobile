@@ -621,13 +621,6 @@ impl MobileApp {
         if self.tts_active {
             return;
         }
-        if !MODELS[3..]
-            .iter()
-            .all(|model| download::installed(&self.model_dir, model))
-        {
-            self.notice = Some("Download the Melo Chinese-English TTS files first".to_owned());
-            return;
-        }
         self.notice = None;
         self.tts_sentences = crate::tts::sentences(&self.markdown);
         if self.tts_sentences.is_empty() {
@@ -645,6 +638,17 @@ impl MobileApp {
         let sender = self.app_sender.clone();
         let sentences = self.tts_sentences.clone();
         let model_dir = self.model_dir.clone();
+        let document_dir = self.current_record_id.and_then(|id| {
+            self.records
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| {
+                    self.data_dir
+                        .join("tts")
+                        .join(id.to_string())
+                        .join(record.tts_revision.to_string())
+                })
+        });
         std::thread::spawn(move || {
             let result = (|| {
                 let mut generated = 0;
@@ -653,8 +657,17 @@ impl MobileApp {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let audio = match crate::tts::synthesize_resilient(sentence, &model_dir, &stop)
-                    {
+                    let result = if let Some(document_dir) = &document_dir {
+                        crate::tts::synthesize_resilient_cached(
+                            sentence,
+                            &model_dir,
+                            document_dir,
+                            &stop,
+                        )
+                    } else {
+                        crate::tts::synthesize_resilient(sentence, &model_dir, &stop)
+                    };
+                    let audio = match result {
                         Ok(audio) => audio,
                         Err(_) if stop.load(Ordering::Relaxed) => break,
                         Err(_) => {
@@ -697,6 +710,39 @@ impl MobileApp {
                 let _ = sender.send(AppEvent::Tts(result));
             }
         });
+    }
+
+    fn regenerate_tts(&mut self) {
+        if self.tts_active {
+            return;
+        }
+        if !MODELS[3..]
+            .iter()
+            .all(|model| download::installed(&self.model_dir, model))
+        {
+            self.notice = Some("Download the Melo Chinese-English TTS files first".to_owned());
+            return;
+        }
+        let Some(index) = self
+            .current_record_id
+            .and_then(|id| self.records.iter().position(|record| record.id == id))
+        else {
+            self.notice = Some("No saved scan record".to_owned());
+            return;
+        };
+        let previous = self.records[index].tts_revision;
+        let Some(next) = previous.checked_add(1) else {
+            self.notice = Some("TTS revision limit reached".to_owned());
+            return;
+        };
+        // ponytail: Retain old revisions so a stopping worker cannot overwrite new audio.
+        self.records[index].tts_revision = next;
+        if let Err(error) = history::save(&self.history_path, &self.records) {
+            self.records[index].tts_revision = previous;
+            self.notice = Some(error);
+            return;
+        }
+        self.start_tts();
     }
 
     fn save_markdown(&mut self) {
@@ -1600,6 +1646,15 @@ impl MobileApp {
                     self.start_tts();
                 }
             }
+            if ui
+                .add_enabled(
+                    !self.tts_active,
+                    egui::Button::new(rust_i18n::t!("mobile_tts_regenerate").into_owned()),
+                )
+                .clicked()
+            {
+                self.regenerate_tts();
+            }
             if self.tts_active {
                 if self.tts_preparing {
                     ui.spinner();
@@ -1708,6 +1763,15 @@ impl MobileApp {
                             );
                             if response.clicked() || response.long_touched() {
                                 response.request_focus();
+                            }
+                            if response.changed()
+                                && let Some(id) = self.current_record_id
+                            {
+                                history::complete(&mut self.records, id, self.markdown.clone());
+                                if let Err(error) = history::save(&self.history_path, &self.records)
+                                {
+                                    self.notice = Some(error);
+                                }
                             }
                         });
                 }

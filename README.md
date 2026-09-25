@@ -17,8 +17,9 @@ Rust/egui Android prototype for offline document OCR. The five application state
 - GameActivity-backed egui text input for Android IMEs; Gradle ABI-split APKs
   for arm64-v8a, armeabi-v7a, x86, and x86_64.
 - Offline Chinese/English Melo TTS with sentence highlighting, adjustable
-  pitch-preserved WSOLA playback speed, cached 1x audio, and recovery when one
-  speech slice fails. Speed changes never rerun TTS inference.
+  pitch-preserved WSOLA playback speed, persistent per-scan 1x audio, and
+  recovery when one speech slice fails. Speed changes never rerun TTS inference;
+  the result page's regenerate button creates a fresh voice-cache revision.
 
 DOCX is generated directly in Rust because official Pandoc Linux archives target
 glibc Linux while Android uses Bionic.

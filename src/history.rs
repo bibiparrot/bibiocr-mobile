@@ -22,6 +22,8 @@ pub struct ScanRecord {
     pub markdown: String,
     #[serde(default)]
     pub stage: ScanStage,
+    #[serde(default)]
+    pub tts_revision: u64,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -59,6 +61,7 @@ pub fn add_result(records: &mut Vec<ScanRecord>, id: u64, image_path: PathBuf, m
             image_path,
             markdown,
             stage: ScanStage::Complete,
+            tts_revision: 0,
         },
     );
 }
@@ -88,6 +91,7 @@ pub fn add_pending(records: &mut Vec<ScanRecord>, id: u64, image_path: PathBuf) 
             image_path,
             markdown: String::new(),
             stage: ScanStage::Captured,
+            tts_revision: 0,
         },
     );
 }
@@ -136,6 +140,7 @@ mod tests {
             image_path: "meeting-photo.png".into(),
             markdown: "# Notes\n\n合同金额 10 元".to_owned(),
             stage: ScanStage::Complete,
+            tts_revision: 0,
         };
         assert!(matches_query(&record, "quarterly"));
         assert!(matches_query(&record, "合同金额"));
@@ -160,9 +165,11 @@ mod tests {
             root.join("photo.jpg"),
             "# Invoice\n\nTotal: 10".to_owned(),
         );
+        records[0].tts_revision = 1;
         save(&path, &records).unwrap();
         let mut loaded = load(&path);
         assert_eq!(loaded[0].title, "Invoice");
+        assert_eq!(loaded[0].tts_revision, 1);
         assert!(remove(&mut loaded, 7));
         assert!(loaded.is_empty());
         std::fs::remove_dir_all(root).unwrap();
@@ -207,5 +214,6 @@ markdown = "# Old"
 "##;
         let records: super::HistoryFile = toml::from_str(text).unwrap();
         assert_eq!(records.records[0].stage, ScanStage::Complete);
+        assert_eq!(records.records[0].tts_revision, 0);
     }
 }
