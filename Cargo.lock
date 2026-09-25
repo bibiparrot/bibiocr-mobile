@@ -303,7 +303,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bibiocr-mobile"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "android-activity",
  "android-build",
@@ -4350,8 +4350,6 @@ dependencies = [
 [[package]]
 name = "sherpa-onnx-sys"
 version = "1.13.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14bbeabb73f73f1c1f4a278af0ee9ae90a19f9727482027047fb9422fa14f8fe"
 dependencies = [
  "bzip2 0.4.4",
  "tar",

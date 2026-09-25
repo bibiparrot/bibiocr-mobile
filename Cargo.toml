@@ -1,6 +1,6 @@
 [package]
 name = "bibiocr-mobile"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -38,6 +38,7 @@ android-build = "0.1.4"
 [patch.crates-io]
 oar-ocr = { path = "vendor/oar-ocr" }
 robius-android-env = { path = "vendor/robius-android-env" }
+sherpa-onnx-sys = { path = "vendor/sherpa-onnx-sys" }
 winit = { path = "vendor/winit-0.30.13" }
 
 [target.'cfg(target_os = "android")'.dependencies]
